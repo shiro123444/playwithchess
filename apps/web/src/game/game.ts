@@ -412,6 +412,9 @@ export function createGame({ canvas, variantId = XIANGQI.id }: Options): GameCon
 
   function onPointerDown(event: PointerEvent): void {
     if (event.button !== 0) return;
+    // The whole canvas is clickable; browser tap feedback would tint that
+    // entire surface instead of the selected piece.
+    event.preventDefault();
     if (!inputAllowed()) return;
     const square = squareAtPointer(event);
     if (square < 0) {
@@ -442,6 +445,7 @@ export function createGame({ canvas, variantId = XIANGQI.id }: Options): GameCon
   }
 
   function onPointerMove(event: PointerEvent): void {
+    if (event.pointerType === 'touch') return;
     const square = squareAtPointer(event);
     if (square === state.hoverSquare) return;
     state.hoverSquare = square;
@@ -506,7 +510,8 @@ export function createGame({ canvas, variantId = XIANGQI.id }: Options): GameCon
       // Screen extent is very nearly proportional to 1/distance, so the ratio
       // is both the error and the correction. Falling short means coming back
       // in again — growing on overflow only would leave the board marooned.
-      const ratio = worst / FIT_MARGIN;
+      const margin = compactPortrait() ? 0.985 : FIT_MARGIN;
+      const ratio = worst / margin;
       if (Math.abs(ratio - 1) < 0.01) break;
       distance = THREE.MathUtils.clamp(distance * ratio, FIT_MIN, FIT_MAX);
     }
@@ -521,9 +526,17 @@ export function createGame({ canvas, variantId = XIANGQI.id }: Options): GameCon
    * marooned in a sea of paper.
    */
   function elevationDegrees(): number {
+    // Uniform piece sizes matter more than foreshortening on a phone.
+    if (window.matchMedia('(max-width: 1000px)').matches) {
+      return compactPortrait() ? 88 : 70;
+    }
     const aspect = canvas.clientWidth / Math.max(canvas.clientHeight, 1);
     const t = THREE.MathUtils.clamp((1.35 - aspect) / 0.9, 0, 1);
     return THREE.MathUtils.lerp(36, 78, t);
+  }
+
+  function compactPortrait(): boolean {
+    return window.matchMedia('(max-width: 1000px) and (orientation: portrait)').matches;
   }
 
   function applyViewSide(): void {
@@ -559,6 +572,13 @@ export function createGame({ canvas, variantId = XIANGQI.id }: Options): GameCon
   };
   window.addEventListener('resize', onResize);
   window.addEventListener('orientationchange', onResize);
+  const canvasResizeObserver = new ResizeObserver(() => {
+    // Mobile browser chrome and CSS layout can resize the canvas without a
+    // matching window resize. Update the projection before fitting it.
+    rig.resize();
+    onResize();
+  });
+  canvasResizeObserver.observe(canvas);
 
   // --- Status -------------------------------------------------------------
 
@@ -759,6 +779,7 @@ export function createGame({ canvas, variantId = XIANGQI.id }: Options): GameCon
     canvas.removeEventListener('wheel', onWheel);
     window.removeEventListener('resize', onResize);
     window.removeEventListener('orientationchange', onResize);
+    canvasResizeObserver.disconnect();
     physics?.dispose();
     rig.dispose();
   }

@@ -187,6 +187,8 @@ pnpm typecheck   # rules / server / web 三个 tsconfig 全过
 - 两个真实标签页轮流走子：红方「炮二平五」→ 黑方收到；黑方「馬8进7」→ 红方收到，回合数更新为 2。
 - 第三个标签页以观战身份进入，尝试点击合法落点不会改变局面；无效房号显示失败并恢复输入；静音设置重新打开页面后保留。
 
+手机交互修正：移动端工具栏和底部操作区各压缩成一行，竖屏采用接近俯视的取景，避免远端棋子因透视而缩小。棋盘关闭浏览器默认按压高亮、文本选择和长按菜单，房号输入框保留正常编辑。已用 Chrome 触摸模拟验证按住棋子与触摸落子，并检查实际 320×568 CSS 视口下联机按钮不溢出；尚未在实体手机上复测。
+
 联机回归测试使用 SDK mock，覆盖独立建房、无效邀请、执黑座位与等待状态、断线重连、拒绝后同步、取消连接和主动退出。浏览器验证不等同于完整协议测试；30 秒断线保座、超时、终局重赛和并发压力未在本轮重测。以前 README 所述的临时 E2E 脚本未纳入仓库，不作为本轮可复现验证依据。
 
 ### 本轮截图
@@ -194,6 +196,10 @@ pnpm typecheck   # rules / server / web 三个 tsconfig 全过
 ![桌面联机](docs/screenshots/watercolor-desktop.jpg)
 
 ![手机竖屏](docs/screenshots/watercolor-mobile.jpg)
+
+![手机放大棋盘与紧凑操作区](docs/screenshots/mobile-large-pieces.jpg)
+
+![按住棋子时仅显示选中圈和落点](docs/screenshots/mobile-touch-pressed.jpg)
 
 ![手机横屏](docs/screenshots/watercolor-landscape.jpg)
 

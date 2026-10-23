@@ -37,6 +37,7 @@
 
 * {
   box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
 }
 
 html,
@@ -56,6 +57,9 @@ body {
   width: 100vw;
   height: 100dvh;
   isolation: isolate;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
   background-color: var(--paper);
   /* Layered radial washes, not a linear gradient: pigment pools in irregular
      patches, so the corners are wetter than the middle. */
@@ -671,6 +675,9 @@ button.chip:hover {
 }
 
 .room-input {
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
   flex: 1;
   min-width: 0;
   padding: 12px 14px;
@@ -858,60 +865,86 @@ button.chip:hover {
 
 @media (max-width: 1000px) {
   #scene {
-    top: calc(108px + env(safe-area-inset-top));
+    top: calc(54px + env(safe-area-inset-top));
     left: 0;
     width: 100%;
-    height: calc(100% - 254px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+    height: calc(100% - 118px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
   }
   .hud-layer {
     grid-template-columns: 1fr;
     grid-template-rows: auto 1fr auto;
-    padding: 10px;
-    padding-top: max(10px, env(safe-area-inset-top));
-    padding-bottom: max(10px, env(safe-area-inset-bottom));
-    gap: 10px;
+    padding: 8px;
+    padding-top: max(8px, env(safe-area-inset-top));
+    padding-bottom: max(8px, env(safe-area-inset-bottom));
+    gap: 8px;
   }
 
   .hud-top {
-    flex-direction: column;
-    align-items: stretch;
-    gap: 10px;
+    flex-direction: row;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .brand-title {
+    font-size: 28px;
   }
 
   .hud-controls {
-    width: 100%;
-    justify-content: space-between;
+    width: auto;
+    flex-wrap: nowrap;
+    justify-content: flex-end;
     gap: 6px;
   }
 
   .hud-controls .ghost-button {
-    min-height: 44px;
-    padding: 9px 10px;
-    font-size: 13px;
+    min-height: 36px;
+    padding: 7px 9px;
+    font-size: 12px;
   }
 
   .seg-button {
-    min-height: 38px;
-    padding: 9px 14px;
-    font-size: 13px;
+    min-height: 30px;
+    padding: 6px 9px;
+    font-size: 12px;
   }
 
   .sound-toggle {
-    min-width: 0;
+    min-width: 36px;
+  }
+
+  .sound-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
   }
 
   .chip {
-    min-height: 44px;
-    padding: 6px 10px;
+    min-height: 36px;
+    padding: 6px 8px;
     font-size: 11px;
   }
 
   .hud-panel {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 6px;
     grid-column: 1;
     grid-row: 3;
     justify-self: stretch;
     width: auto;
-    padding: 12px 14px;
+    padding: 8px;
+  }
+
+  .turn-pill {
+    flex-shrink: 0;
+    gap: 5px;
+    padding: 6px 8px;
+    font-size: 12px;
   }
 
   .hud-panel .meta-row {
@@ -920,7 +953,7 @@ button.chip:hover {
 
   .hud-panel .connect-row:not([hidden]) {
     display: flex;
-    float: right;
+    flex-shrink: 0;
     padding: 6px 0;
     border: 0;
   }
@@ -930,11 +963,28 @@ button.chip:hover {
   }
 
   .hud-actions {
-    margin-top: 10px;
+    flex-shrink: 0;
+    gap: 6px;
+    margin: 0 0 0 auto;
   }
 
   .hud-actions .ghost-button {
-    min-height: 44px;
+    min-height: 36px;
+    padding: 7px 10px;
+    font-size: 12px;
+    white-space: nowrap;
+  }
+
+  .notice {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: calc(100% + 8px);
+    margin: 0;
+    padding: 8px 10px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: rgba(248, 251, 252, 0.94);
   }
 
   .result-banner {
@@ -954,10 +1004,10 @@ button.chip:hover {
 /* Very short landscape phones: the panel must not eat the board. */
 @media (max-height: 520px) and (orientation: landscape) {
   #scene {
-    top: calc(60px + env(safe-area-inset-top));
+    top: calc(52px + env(safe-area-inset-top));
     left: env(safe-area-inset-left);
     width: calc(100% - 220px - env(safe-area-inset-left) - env(safe-area-inset-right));
-    height: calc(100% - 70px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+    height: calc(100% - 60px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
   }
 
   .hud-layer {
@@ -982,9 +1032,14 @@ button.chip:hover {
   }
 
   .hud-panel {
+    display: block;
     grid-column: 2;
     grid-row: 2;
     padding: 10px 12px;
+  }
+
+  .hud-actions {
+    margin-top: 8px;
   }
 
   .hud-panel .meta-row {
