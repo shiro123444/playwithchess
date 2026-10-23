@@ -1,0 +1,17 @@
+{
+  "name": "@xiangqi/server",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "scripts": {
+    "start": "node --experimental-strip-types --experimental-transform-types src/index.ts",
+    "dev": "node --watch --experimental-strip-types --experimental-transform-types src/index.ts"
+  },
+  "dependencies": {
+    "@colyseus/core": "0.18.21",
+    "@colyseus/schema": "5.0.42",
+    "@colyseus/ws-transport": "0.18.4",
+    "@xiangqi/rules": "workspace:*"
+  },
+  "devDependencies": { "typescript": "5.9.3" }
+}

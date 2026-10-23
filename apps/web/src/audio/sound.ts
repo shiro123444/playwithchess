@@ -1,0 +1,212 @@
+/**
+ * Synthesised cues, no audio files.
+ *
+ * Every sound is built from a noise burst (the wood-on-wood attack) plus a
+ * short pitched body (the mass behind the click). Generating them at playback
+ * time keeps the bundle free of media assets and makes the timbre tunable in
+ * code instead of in an editor.
+ *
+ * The AudioContext is created lazily on the first cue so a muted visitor never
+ * opens an audio device, and so the first cue — always triggered by a pointer
+ * gesture — is allowed to start.
+ */
+
+export type SoundCue = 'move' | 'capture' | 'check' | 'end' | 'click';
+
+const STORAGE_KEY = 'xiangqi.sound';
+
+/** Master trim; individual cues are mixed under this. */
+const MASTER_GAIN = 0.55;
+
+function readPreference(): boolean {
+  try {
+    return window.localStorage.getItem(STORAGE_KEY) !== 'off';
+  } catch {
+    // Private mode or a blocked storage partition: sound still works, it just
+    // cannot remember the choice.
+    return true;
+  }
+}
+
+function writePreference(enabled: boolean): void {
+  try {
+    window.localStorage.setItem(STORAGE_KEY, enabled ? 'on' : 'off');
+  } catch {
+    // Non-fatal: the toggle stays correct for this page load.
+  }
+}
+
+interface WoodOptions {
+  /** Peak gain, 0–1. */
+  level: number;
+  /** Body pitch in Hz at the strike. */
+  pitch: number;
+  /** Decay in seconds. */
+  decay: number;
+  /** Centre frequency of the noise band. */
+  noiseHz: number;
+  /** Delay from `when`, in seconds. */
+  offset?: number;
+}
+
+export class SoundBoard {
+  private context: AudioContext | null = null;
+  private master: GainNode | null = null;
+  private noiseBuffer: AudioBuffer | null = null;
+  private enabled = readPreference();
+
+  get isEnabled(): boolean {
+    return this.enabled;
+  }
+
+  setEnabled(enabled: boolean): void {
+    this.enabled = enabled;
+    writePreference(enabled);
+    if (!enabled) {
+      // Cut anything still ringing so the mute is immediate.
+      this.context?.suspend().catch(() => undefined);
+      return;
+    }
+    void this.context?.resume().catch(() => undefined);
+  }
+
+  toggle(): boolean {
+    this.setEnabled(!this.enabled);
+    return this.enabled;
+  }
+
+  play(cue: SoundCue): void {
+    if (!this.enabled) return;
+    const context = this.ensureContext();
+    if (!context) return;
+    const out = this.master;
+    if (!out) return;
+    if (context.state === 'suspended') {
+      // Autoplay policy: resume on the gesture that is asking for the sound.
+      void context.resume().catch(() => undefined);
+    }
+    const now = context.currentTime + 0.002;
+    switch (cue) {
+      case 'move':
+        this.wood(context, out, now, { level: 0.22, pitch: 190, decay: 0.09, noiseHz: 1500 });
+        break;
+      case 'capture':
+        // Two hits a hair apart read as a piece tipping over, not a single tap.
+        this.wood(context, out, now, { level: 0.4, pitch: 130, decay: 0.16, noiseHz: 950 });
+        this.wood(context, out, now, { level: 0.22, pitch: 210, decay: 0.1, noiseHz: 1700, offset: 0.035 });
+        break;
+      case 'check':
+        this.chime(context, out, now, [660, 990], 0.11, 0.9);
+        break;
+      case 'end':
+        this.arpeggio(context, out, now, [523.25, 659.25, 783.99]);
+        break;
+      case 'click':
+        this.wood(context, out, now, { level: 0.09, pitch: 340, decay: 0.035, noiseHz: 2600 });
+        break;
+    }
+  }
+
+  dispose(): void {
+    void this.context?.close().catch(() => undefined);
+    this.context = null;
+    this.master = null;
+    this.noiseBuffer = null;
+  }
+
+  // --- Building blocks ----------------------------------------------------
+
+  private ensureContext(): AudioContext | null {
+    if (this.context) return this.context;
+    const Ctor =
+      window.AudioContext ??
+      (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!Ctor) return null;
+    try {
+      const context = new Ctor();
+      const master = context.createGain();
+      master.gain.value = MASTER_GAIN;
+      master.connect(context.destination);
+      this.context = context;
+      this.master = master;
+      return context;
+    } catch (error: unknown) {
+      // No audio output available (rare, but it must not break the game).
+      console.warn('Audio unavailable, playing silently', error);
+      return null;
+    }
+  }
+
+  private noise(context: AudioContext): AudioBuffer {
+    if (this.noiseBuffer) return this.noiseBuffer;
+    // One buffer serves every cue. 250 ms covers the longest noise decay
+    // (the capture's 160 ms) with room to spare; a source that outlives its
+    // buffer just goes silent, so being generous costs nothing at runtime.
+    const length = Math.floor(context.sampleRate * 0.25);
+    const buffer = context.createBuffer(1, length, context.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < length; i++) data[i] = Math.random() * 2 - 1;
+    this.noiseBuffer = buffer;
+    return buffer;
+  }
+
+  /** A wooden strike: filtered noise attack plus a fast-dropping sine body. */
+  private wood(context: AudioContext, out: AudioNode, now: number, options: WoodOptions): void {
+    const at = now + (options.offset ?? 0);
+
+    const source = context.createBufferSource();
+    source.buffer = this.noise(context);
+    const band = context.createBiquadFilter();
+    band.type = 'bandpass';
+    band.frequency.value = options.noiseHz;
+    band.Q.value = 1.2;
+    const attack = context.createGain();
+    attack.gain.setValueAtTime(options.level, at);
+    attack.gain.exponentialRampToValueAtTime(0.0001, at + options.decay);
+    source.connect(band).connect(attack).connect(out);
+    source.start(at);
+    source.stop(at + options.decay + 0.02);
+
+    const body = context.createOscillator();
+    body.type = 'sine';
+    body.frequency.setValueAtTime(options.pitch, at);
+    body.frequency.exponentialRampToValueAtTime(options.pitch * 0.55, at + options.decay);
+    const bodyGain = context.createGain();
+    bodyGain.gain.setValueAtTime(options.level * 0.8, at);
+    bodyGain.gain.exponentialRampToValueAtTime(0.0001, at + options.decay * 1.4);
+    body.connect(bodyGain).connect(out);
+    body.start(at);
+    body.stop(at + options.decay * 1.5);
+  }
+
+  /** A struck bell: a small stack of partials sharing one envelope. */
+  private chime(
+    context: AudioContext,
+    out: AudioNode,
+    now: number,
+    partials: number[],
+    level: number,
+    decay: number,
+  ): void {
+    for (const frequency of partials) {
+      const tone = context.createOscillator();
+      tone.type = 'triangle';
+      tone.frequency.value = frequency;
+      const gain = context.createGain();
+      // A 6 ms ramp avoids the click of a hard start.
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(level, now + 0.006);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + decay);
+      tone.connect(gain).connect(out);
+      tone.start(now);
+      tone.stop(now + decay + 0.02);
+    }
+  }
+
+  private arpeggio(context: AudioContext, out: AudioNode, now: number, notes: number[]): void {
+    notes.forEach((frequency, index) => {
+      const at = now + index * 0.12;
+      this.chime(context, out, at, [frequency], 0.1, 0.65);
+    });
+  }
+}
