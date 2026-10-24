@@ -203,6 +203,13 @@ export class RoomDialog {
     this.input.select();
   }
 
+  showConnecting(code: string): void {
+    this.showEntry('', code);
+    this.busy = true;
+    this.refreshEntry();
+    this.setEntryStatus('正在恢复棋局…', 'idle');
+  }
+
   /** Open on the waiting view for `code`. */
   showWaiting(code: string, waiting: boolean, status = ''): void {
     this.code = code;

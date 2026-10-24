@@ -1,10 +1,9 @@
 /**
- * Synthesised cues, no audio files.
+ * Recorded collision samples with synthesis as a decoding/network fallback.
  *
- * Every sound is built from a noise burst (the wood-on-wood attack) plus a
- * short pitched body (the mass behind the click). Generating them at playback
- * time keeps the bundle free of media assets and makes the timbre tunable in
- * code instead of in an editor.
+ * Move and capture cues use CC0 tabletop collision recordings. Menu, check
+ * and end cues stay synthesised; a short wooden synthesis is the fallback
+ * when recorded samples cannot be fetched or decoded.
  *
  * The AudioContext is created lazily on the first cue so a muted visitor never
  * opens an audio device, and so the first cue — always triggered by a pointer
@@ -54,6 +53,42 @@ export class SoundBoard {
   private master: GainNode | null = null;
   private noiseBuffer: AudioBuffer | null = null;
   private enabled = readPreference();
+  private samples: AudioBuffer[] = [];
+  private loading: Promise<void> | null = null;
+  private activeSamples = new Set<AudioBufferSourceNode>();
+
+  /** Unlock on the selecting gesture, before the later landing animation. */
+  unlock(): void {
+    if (!this.enabled) return;
+    const context = this.ensureContext();
+    if (context?.state === 'suspended') void context.resume().catch(() => undefined);
+  }
+
+  private loadSamples(context: AudioContext): void {
+    if (this.loading) return;
+    this.loading = Promise.all([1, 2, 3].map(async id => {
+      const response = await fetch(`${import.meta.env.BASE_URL}audio/collision-${id}.wav`);
+      if (!response.ok) throw new Error('sample unavailable');
+      return context.decodeAudioData(await response.arrayBuffer());
+    })).then(samples => { if (this.context === context) this.samples = samples; }).catch(() => undefined);
+  }
+
+  private recorded(context: AudioContext, out: AudioNode, now: number, capture: boolean): boolean {
+    if (this.samples.length !== 3) return false;
+    const strike = (index: number, offset: number, level: number) => {
+      const source = context.createBufferSource();
+      source.buffer = this.samples[index];
+      source.playbackRate.value = 0.97 + Math.random() * 0.06;
+      const gain = context.createGain(); gain.gain.value = level;
+      source.connect(gain).connect(out);
+      this.activeSamples.add(source);
+      source.onended = () => { this.activeSamples.delete(source); source.disconnect(); gain.disconnect(); };
+      source.start(now + offset);
+    };
+    strike(capture ? 1 : Math.floor(Math.random() * 3), 0, capture ? 0.85 : 0.72);
+    if (capture) strike(2, 0.045, 0.48);
+    return true;
+  }
 
   get isEnabled(): boolean {
     return this.enabled;
@@ -64,6 +99,8 @@ export class SoundBoard {
     writePreference(enabled);
     if (!enabled) {
       // Cut anything still ringing so the mute is immediate.
+      for (const source of this.activeSamples) { try { source.stop(); } catch { /* already ended */ } }
+      this.activeSamples.clear();
       this.context?.suspend().catch(() => undefined);
       return;
     }
@@ -88,9 +125,11 @@ export class SoundBoard {
     const now = context.currentTime + 0.002;
     switch (cue) {
       case 'move':
+        if (this.recorded(context, out, now, false)) break;
         this.wood(context, out, now, { level: 0.22, pitch: 190, decay: 0.09, noiseHz: 1500 });
         break;
       case 'capture':
+        if (this.recorded(context, out, now, true)) break;
         // Two hits a hair apart read as a piece tipping over, not a single tap.
         this.wood(context, out, now, { level: 0.4, pitch: 130, decay: 0.16, noiseHz: 950 });
         this.wood(context, out, now, { level: 0.22, pitch: 210, decay: 0.1, noiseHz: 1700, offset: 0.035 });
@@ -112,6 +151,8 @@ export class SoundBoard {
     this.context = null;
     this.master = null;
     this.noiseBuffer = null;
+    this.samples = [];
+    this.loading = null;
   }
 
   // --- Building blocks ----------------------------------------------------
@@ -129,6 +170,7 @@ export class SoundBoard {
       master.connect(context.destination);
       this.context = context;
       this.master = master;
+      this.loadSamples(context);
       return context;
     } catch (error: unknown) {
       // No audio output available (rare, but it must not break the game).

@@ -1,6 +1,12 @@
 import * as THREE from 'three';
 import {
   BLACK,
+  createRecord,
+  replayRecord,
+  resultFor,
+  PIECE_GLYPHS,
+  type GameRecord,
+  type GameResult,
   RED,
   Position,
   XIANGQI,
@@ -24,6 +30,7 @@ import {
   GRID_DEPTH,
   GRID_WIDTH,
   PIECE_HEIGHT,
+  PALETTE,
   SURFACE_Y,
   squareToWorld,
 } from '../engine/config.ts';
@@ -44,7 +51,8 @@ import { SCENE_FOV, createSceneRig } from '../engine/scene.ts';
 const ANIMATION_MS = 320;
 const CAMERA_LERP = 0.07;
 
-export type GameViewMode = 'local' | 'online';
+export type GameViewMode = 'local' | 'online' | 'review';
+export type ViewPreset = 'auto' | 'overhead' | 'angled' | 'low';
 
 /**
  * Cues the view asks the shell to play. They live here rather than in the
@@ -61,16 +69,24 @@ export interface GameStatusSnapshot {
   mode: GameViewMode;
   onlineSide: Color | null;
   connected: boolean;
+  ready: boolean;
+  result: GameResult | null;
+  selection: string | null;
+  reviewPly: number;
+  totalMoves: number;
 }
 
 export interface GameController {
   start(): void;
   dispose(): void;
-  undo(): void;
+  undo(): boolean;
   restart(): void;
-  setOnlinePosition(fen: string, lastMoveUci: string | null, notation?: string): void;
   setMode(mode: GameViewMode, side: Color | null): void;
   setConnection(connected: boolean, ready: boolean): void;
+  loadRecord(record: GameRecord, animate?: boolean, ply?: number): void;
+  getRecord(): GameRecord;
+  setViewPreset(preset: ViewPreset): void;
+  onRecord: ((record: GameRecord) => void) | null;
   onStatus: ((snapshot: GameStatusSnapshot) => void) | null;
   /** Called with the move the player made; the online layer forwards it. */
   onLocalMove: ((uci: string) => void) | null;
@@ -87,7 +103,11 @@ interface Options {
 
 export function createGame({ canvas, variantId = XIANGQI.id }: Options): GameController {
   const variant: VariantConfig = getVariant(variantId);
-  const position = new Position(variant);
+  let position = new Position(variant);
+  let record = createRecord(crypto.randomUUID(), variant.id);
+  let reviewPly = -1;
+  let preset: ViewPreset = 'auto';
+  let recordListener: ((record: GameRecord) => void) | null = null;
   const rig = createSceneRig(canvas);
   const { renderer, scene, camera } = rig;
 
@@ -111,6 +131,16 @@ export function createGame({ canvas, variantId = XIANGQI.id }: Options): GameCon
     scene.add(marker);
   }
 
+  const travelArrow = new THREE.ArrowHelper(new THREE.Vector3(1, 0, 0), new THREE.Vector3(), 1, 0xb4463c, 0.3, 0.18);
+  travelArrow.visible = false;
+  (travelArrow.line.material as THREE.Material).transparent = true;
+  (travelArrow.line.material as THREE.Material).opacity = 0.65;
+  scene.add(travelArrow);
+  const landingRing = createLastMoveMarker(0x3f7aa8);
+  landingRing.visible = false;
+  scene.add(landingRing);
+  let landingAt = 0;
+  let selectionVisual: PieceVisual | null = null;
   const raycaster = new THREE.Raycaster();
   const pointer = new THREE.Vector2();
 
@@ -143,7 +173,6 @@ export function createGame({ canvas, variantId = XIANGQI.id }: Options): GameCon
   let rafId = 0;
   // The first online snapshot describes a board that was already in progress;
   // its "last move" happened before we arrived and must not make a sound.
-  let awaitingFirstOnlineSync = true;
   let lastFrame = performance.now();
   let cameraTarget = new THREE.Vector3(0, 12.5, 11.5);
   let destroyed = false;
@@ -242,6 +271,11 @@ export function createGame({ canvas, variantId = XIANGQI.id }: Options): GameCon
   // --- Selection / markers ------------------------------------------------
 
   function clearMarkers(): void {
+    if (selectionVisual) {
+      selectionVisual.mesh.scale.setScalar(1);
+      if (!state.animating) selectionVisual.mesh.position.y = SURFACE_Y;
+      selectionVisual = null;
+    }
     for (const marker of moveMarkers) {
       marker.visible = false;
     }
@@ -252,6 +286,7 @@ export function createGame({ canvas, variantId = XIANGQI.id }: Options): GameCon
     clearMarkers();
     const visual = pieces.get(from);
     if (visual) {
+      selectionVisual = visual;
       selectionRing.position.set(visual.mesh.position.x, SURFACE_Y + 0.012, visual.mesh.position.z);
       selectionRing.visible = true;
     }
@@ -269,7 +304,8 @@ export function createGame({ canvas, variantId = XIANGQI.id }: Options): GameCon
       }
       const world = worldFor(to);
       const occupied = position.board[to] !== 0;
-      marker.scale.setScalar(occupied ? 2.05 : 1);
+      marker.userData.baseScale = occupied ? 2.5 : 1.4;
+      marker.scale.setScalar(marker.userData.baseScale as number);
       marker.position.set(world.x, SURFACE_Y + 0.014, world.z);
       marker.visible = true;
       index++;
@@ -278,6 +314,7 @@ export function createGame({ canvas, variantId = XIANGQI.id }: Options): GameCon
 
   function showLastMove(): void {
     if (!state.lastMove) {
+      travelArrow.visible = false;
       for (const marker of lastMoveMarkers) marker.visible = false;
       return;
     }
@@ -285,6 +322,15 @@ export function createGame({ canvas, variantId = XIANGQI.id }: Options): GameCon
     const toWorld = worldFor(state.lastMove.to);
     lastMoveMarkers[0]!.position.set(fromWorld.x, SURFACE_Y + 0.008, fromWorld.z);
     lastMoveMarkers[1]!.position.set(toWorld.x, SURFACE_Y + 0.008, toWorld.z);
+    const direction = toWorld.clone().sub(fromWorld);
+    const moverColor = colorOf(position.board[state.lastMove.to]);
+    const routeColor = moverColor === RED ? PALETTE.vermilion : PALETTE.cobalt;
+    travelArrow.setColor(routeColor);
+    for (const marker of lastMoveMarkers) (marker.material as THREE.MeshBasicMaterial).color.setHex(routeColor);
+    travelArrow.position.copy(fromWorld).add(new THREE.Vector3(0, 0.025, 0));
+    travelArrow.setDirection(direction.clone().normalize());
+    travelArrow.setLength(direction.length(), 0.3, 0.18);
+    travelArrow.visible = true;
     lastMoveMarkers[0]!.visible = true;
     lastMoveMarkers[1]!.visible = true;
   }
@@ -292,7 +338,7 @@ export function createGame({ canvas, variantId = XIANGQI.id }: Options): GameCon
   // --- Move application ---------------------------------------------------
 
   function inputAllowed(): boolean {
-    if (state.animating) return false;
+    if (state.animating || state.mode === 'review' || record.result) return false;
     if (position.status().kind !== 'playing') return false;
     if (state.mode === 'online') {
       if (!state.connected || !state.ready || state.pendingMove || state.onlineSide === null) return false;
@@ -310,6 +356,9 @@ export function createGame({ canvas, variantId = XIANGQI.id }: Options): GameCon
     const captured = position.board[to] !== 0 ? pieces.get(to) : undefined;
 
     position.makeMove(move);
+    record = { ...record, moves: [...record.moves, { uci: position.moveToUci(move), notation, at: Date.now() }],
+      updatedAt: Date.now(), result: resultFor(position.status()) };
+    if (state.mode === 'local') recordListener?.(structuredClone(record));
     state.moveHistory.push({ move, notation });
     state.lastNotation = notation;
     state.lastMove = { from, to };
@@ -338,6 +387,7 @@ export function createGame({ canvas, variantId = XIANGQI.id }: Options): GameCon
           showLastMove();
           // Sound follows the landing, not the click: the piece hitting the
           // board is the event, and the capture's second hit trails it.
+          flashLanding(to);
           soundFor(captured !== undefined);
           emitStatus();
         });
@@ -355,7 +405,16 @@ export function createGame({ canvas, variantId = XIANGQI.id }: Options): GameCon
     if (!animate) soundFor(captured !== undefined);
 
     if (notify) localMoveListener?.(position.moveToUci(move));
-    if (!animate || !mover || !notify) emitStatus();
+    // Disable undo immediately while the piece is in flight, then enable it
+    // again in the landing callback. A previous move may already be undoable.
+    emitStatus();
+  }
+
+  function flashLanding(square: number): void {
+    landingAt = performance.now();
+    landingRing.position.copy(worldFor(square));
+    landingRing.position.y += 0.03;
+    landingRing.visible = true;
   }
 
   /** Cue a move that has just been applied (see `cuesFor` for the mix). */
@@ -419,7 +478,9 @@ export function createGame({ canvas, variantId = XIANGQI.id }: Options): GameCon
     const square = squareAtPointer(event);
     if (square < 0) {
       state.selected = -1;
+      state.legalTargets.clear();
       clearMarkers();
+      emitStatus();
       return;
     }
     const pending = state.legalTargets.get(square);
@@ -438,10 +499,13 @@ export function createGame({ canvas, variantId = XIANGQI.id }: Options): GameCon
     if (piece !== 0 && colorOf(piece) === position.sideToMove) {
       state.selected = square;
       showMarkers(square);
+      emitStatus();
       return;
     }
     state.selected = -1;
+    state.legalTargets.clear();
     clearMarkers();
+    emitStatus();
   }
 
   function onPointerMove(event: PointerEvent): void {
@@ -526,6 +590,9 @@ export function createGame({ canvas, variantId = XIANGQI.id }: Options): GameCon
    * marooned in a sea of paper.
    */
   function elevationDegrees(): number {
+    if (preset === 'overhead') return 89.5;
+    if (preset === 'angled') return 58;
+    if (preset === 'low') return 25;
     // Uniform piece sizes matter more than foreshortening on a phone.
     if (window.matchMedia('(max-width: 1000px)').matches) {
       return compactPortrait() ? 88 : 70;
@@ -599,6 +666,12 @@ export function createGame({ canvas, variantId = XIANGQI.id }: Options): GameCon
       mode: state.mode,
       onlineSide: state.onlineSide,
       connected: state.connected,
+      ready: state.ready,
+      result: reviewPly >= 0 && reviewPly < record.moves.length ? null : record.result,
+      selection: state.selected < 0 ? null : `${position.sideToMove === RED ? '红' : '黑'}${
+        PIECE_GLYPHS[(position.board[state.selected] ?? 0) & 7]?.[position.sideToMove === RED ? 'red' : 'black'] ?? '棋'} · ${state.legalTargets.size} 个落点`,
+      reviewPly: reviewPly < 0 ? record.moves.length : reviewPly,
+      totalMoves: record.moves.length,
     });
   }
 
@@ -619,9 +692,22 @@ export function createGame({ canvas, variantId = XIANGQI.id }: Options): GameCon
     // Gentle breathing on the selection ring keeps it from feeling static.
     if (selectionRing.visible) {
       const pulse = 1 + Math.sin(now * 0.004) * 0.045;
-      selectionRing.scale.setScalar(pulse);
+      selectionRing.scale.setScalar(pulse * 1.12);
+      if (selectionVisual) {
+        selectionVisual.mesh.scale.setScalar(1.07 + Math.sin(now * 0.004) * 0.015);
+        selectionVisual.mesh.position.y = SURFACE_Y + 0.08 + Math.sin(now * 0.004) * 0.025;
+      }
     }
 
+    for (const marker of moveMarkers) if (marker.visible) {
+      marker.scale.setScalar((marker.userData.baseScale as number) * (1 + Math.sin(now * 0.005) * 0.13));
+    }
+    if (landingRing.visible) {
+      const t = (now - landingAt) / 800;
+      landingRing.scale.setScalar(1.05 + t * 1.1);
+      (landingRing.material as THREE.MeshBasicMaterial).opacity = Math.max(0, 0.95 * (1 - t));
+      if (t >= 1) landingRing.visible = false;
+    }
     renderer.render(scene, camera);
   }
 
@@ -652,122 +738,74 @@ export function createGame({ canvas, variantId = XIANGQI.id }: Options): GameCon
       });
   }
 
-  function undo(): void {
-    if (state.animating || state.moveHistory.length === 0) return;
-    if (state.mode === 'online') return;
-    position.unmakeMove();
-    state.moveHistory.pop();
-    const previous = state.moveHistory[state.moveHistory.length - 1] ?? null;
-    state.lastMove = previous
-      ? { from: moveFrom(previous.move), to: moveTo(previous.move) }
-      : null;
-    state.lastNotation = previous?.notation ?? '';
-    physics?.removeDebris();
-    for (const [square, visual] of pieces) {
-      pieceLayer.remove(visual.mesh);
-      pieces.delete(square);
-    }
-    // Rebuild every visual so captured pieces come back.
-    for (const visual of tweens.splice(0)) pieceLayer.remove(visual.mesh);
-    syncPieces();
-    for (const visual of pieces.values()) {
-      const world = worldFor(visual.mesh.userData.square as number);
-      visual.mesh.position.copy(world);
-      visual.home.copy(world);
-    }
-    clearMarkers();
-    showLastMove();
-    updateCameraForTurn();
-    emitStatus();
+  function undo(): boolean {
+    if (state.animating || !record.moves.length || state.mode !== 'local') return false;
+    const next = { ...record, moves: record.moves.slice(0, -1), result: null, updatedAt: Date.now() };
+    loadRecord(next, true);
+    recordListener?.(structuredClone(record));
+    return true;
   }
 
   function restart(): void {
-    tweens.length = 0;
-    state.animating = false;
-    state.pendingMove = false;
-    state.moveHistory.length = 0;
-    state.lastNotation = '';
-    state.legalTargets.clear();
-    position.setFen(variant.startFen);
-    physics?.removeDebris();
-    for (const [, visual] of pieces) pieceLayer.remove(visual.mesh);
-    pieces.clear();
-    syncPieces();
-    state.lastMove = null;
-    state.selected = -1;
-    clearMarkers();
-    showLastMove();
-    updateCameraForTurn();
-    emitStatus();
+    loadRecord(createRecord(crypto.randomUUID(), variant.id));
+    recordListener?.(structuredClone(record));
   }
 
-  function setOnlinePosition(fen: string, lastMoveUci: string | null, notation = ''): void {
+  function loadRecord(next: GameRecord, animate = false, ply = next.moves.length): void {
+    const restored = replayRecord(next, ply);
     state.pendingMove = false;
-    // Rebuild from the server's authoritative FEN; animate the tail move when
-    // we can identify it so remote play still feels physical.
-    // Whatever this call turns out to be, the join handshake is over. The flag
-    // has to be consumed before the equal-FEN early return: a fresh room's
-    // snapshot is identical to the start position we already show, and if that
-    // call skipped the reset the first *real* remote move would be swallowed.
-    const announce = !awaitingFirstOnlineSync;
-    awaitingFirstOnlineSync = false;
-    const previousFen = position.fen();
-    if (fen === previousFen) {
-      emitStatus();
-      return;
-    }
-    const previousCount = countPieces();
-    state.animating = false;
-    tweens.length = 0;
-    state.selected = -1;
-    state.legalTargets.clear();
-    state.lastMove = null;
-    physics?.removeDebris();
-    state.lastNotation = notation;
-    position.setFen(fen);
-    // A shrink in material is the only capture signal a bare FEN gives us.
-    const captured = countPieces() < previousCount;
-    for (const [, visual] of pieces) pieceLayer.remove(visual.mesh);
-    pieces.clear();
-    syncPieces();
-    if (lastMoveUci && lastMoveUci.length >= 4) {
-      // Parse the squares directly: the move has already been applied to the
-      // FEN we just loaded, so asking which legal moves exist cannot find it.
-      const from = uciToSquare(lastMoveUci.slice(0, 2), position.geo.width, position.geo.height);
-      const to = uciToSquare(lastMoveUci.slice(2, 4), position.geo.width, position.geo.height);
-      if (from >= 0 && to >= 0) {
-        state.lastMove = { from, to };
-        const visual = pieces.get(to);
-        if (visual) {
-          state.animating = true;
-          const world = worldFor(to);
-          visual.mesh.position.set(world.x, world.y + PIECE_HEIGHT * 1.4, world.z);
-          if (announce) {
-            tweenTo(visual.mesh, world, ANIMATION_MS, PIECE_HEIGHT * 0.4, () => {
-              state.animating = false;
-              soundFor(captured);
-              emitStatus();
-            });
-          } else {
-            tweenTo(visual.mesh, world, ANIMATION_MS, PIECE_HEIGHT * 0.4, () => {
-              state.animating = false;
-              emitStatus();
-            });
-          }
-        }
+    const previous = record;
+    // An ordinary server move follows the exact same physical animation as local play.
+    if (animate && next.id === previous.id && next.moves.length === previous.moves.length + 1 &&
+        previous.moves.every((move, i) => next.moves[i].uci === move.uci) && ply === next.moves.length) {
+      const move = position.findUciMove(next.moves.at(-1)!.uci);
+      if (move >= 0) {
+        applyMove(move, true, false);
+        record = structuredClone(next);
+        reviewPly = -1;
+        return;
       }
     }
+    const tail = previous.moves.at(-1);
+    const undone = animate && next.id === previous.id && next.moves.length < previous.moves.length && tail;
+    const undoFrom = undone ? uciToSquare(tail.uci.slice(2), position.geo.width, position.geo.height) : -1;
+    const undoTo = undone ? uciToSquare(tail.uci.slice(0, 2), position.geo.width, position.geo.height) : -1;
     clearMarkers();
-    showLastMove();
-    emitStatus();
-  }
-
-  function countPieces(): number {
-    let total = 0;
-    for (let square = 0; square < position.geo.squares; square++) {
-      if (position.board[square] !== 0) total++;
+    state.selected = -1;
+    state.legalTargets.clear();
+    state.pendingMove = false;
+    state.animating = false;
+    tweens.length = 0;
+    physics?.removeDebris();
+    pieceLayer.clear();
+    pieces.clear();
+    record = structuredClone(next);
+    reviewPly = state.mode === 'review' ? ply : -1;
+    position = restored;
+    state.moveHistory = [];
+    const probe = new Position(variant);
+    probe.setFen(next.initialFen);
+    for (const item of next.moves.slice(0, ply)) {
+      const move = probe.findUciMove(item.uci);
+      state.moveHistory.push({ move, notation: toChineseNotation(probe, move) });
+      probe.makeMove(move);
     }
-    return total;
+    const last = state.moveHistory.at(-1);
+    state.lastMove = last ? { from: moveFrom(last.move), to: moveTo(last.move) } : null;
+    state.lastNotation = last?.notation ?? '';
+    syncPieces();
+    showLastMove();
+    const mover = pieces.get(undoTo);
+    if (undone && mover && undoFrom >= 0) {
+      mover.mesh.position.copy(worldFor(undoFrom));
+      state.animating = true;
+      tweenTo(mover.mesh, worldFor(undoTo), ANIMATION_MS, PIECE_HEIGHT, () => {
+        state.animating = false;
+        flashLanding(undoTo);
+        emitStatus();
+      });
+    }
+    emitStatus();
   }
 
   function dispose(): void {
@@ -789,15 +827,22 @@ export function createGame({ canvas, variantId = XIANGQI.id }: Options): GameCon
     dispose,
     undo,
     restart,
-    setOnlinePosition,
+    loadRecord,
+    getRecord: () => structuredClone(record),
+    setViewPreset(next) {
+      preset = next;
+      zoom = 1;
+      applyViewSide();
+      camera.position.copy(cameraTarget);
+    },
+    get onRecord() { return recordListener; },
+    set onRecord(listener) { recordListener = listener; },
     setMode(mode, side) {
-      const changed = state.mode !== mode;
       state.mode = mode;
       state.onlineSide = side;
       state.selected = -1;
       state.legalTargets.clear();
       clearMarkers();
-      if (changed) awaitingFirstOnlineSync = true;
       // Sit behind your own army online; otherwise keep the red-side view.
       if (mode === 'online' && side !== null) viewSide = side;
       else viewSide = RED;

@@ -1,0 +1,5 @@
+Collision sounds: Kenney Board Game Pack, Bonus/chipsCollide1.ogg through chipsCollide3.ogg.
+Source: https://kenney.nl/assets/boardgame-pack
+License: Creative Commons CC0 1.0. See LICENSE-Kenney.txt.
+WAV versions converted to mono 44100 Hz for Web Audio compatibility.
+These are tabletop chip collisions, not recordings of this particular Xiangqi set.

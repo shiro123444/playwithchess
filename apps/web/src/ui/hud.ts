@@ -10,6 +10,8 @@ export interface HudHandlers {
   onUndo: () => void;
   onRestart: () => void;
   onFlip: () => void;
+  onHistory: () => void;
+  onReviewNext: () => void;
   onModeChange: (mode: 'local' | 'online') => void;
   onOpenRoom: () => void;
   /** Returns the state the switch should now show. */
@@ -50,6 +52,10 @@ export class Hud {
   private readonly soundButton: HTMLButtonElement;
   private readonly soundIcon: HTMLElement;
   private readonly soundLabel: HTMLElement;
+  private readonly nextButton: HTMLButtonElement;
+  private readonly activity: HTMLElement;
+  private readonly turnBanner: HTMLElement;
+  private previousTurn = '';
   private noticeTimer: number | null = null;
 
   constructor(container: HTMLElement, private readonly handlers: HudHandlers) {
@@ -102,11 +108,14 @@ export class Hud {
     sound.addEventListener('click', () => this.setSound(this.handlers.onToggleSound()));
     this.soundButton = sound;
 
-    const flip = el('button', 'ghost-button', '翻转');
+    const flip = el('button', 'ghost-button', '视角');
     flip.type = 'button';
     flip.addEventListener('click', () => this.handlers.onFlip());
 
-    controls.append(modeSwitch, this.roomChip, sound, flip);
+    const history = el('button', 'ghost-button', '棋局');
+    history.type = 'button';
+    history.addEventListener('click', () => this.handlers.onHistory());
+    controls.append(modeSwitch, this.roomChip, sound, history, flip);
     top.append(brand, controls);
     this.root.append(top);
 
@@ -141,7 +150,11 @@ export class Hud {
     this.restartButton = restart;
     restart.type = 'button';
     restart.addEventListener('click', () => this.handlers.onRestart());
-    actions.append(this.undoButton, restart);
+    this.nextButton = el('button', 'ghost-button', '下一手');
+    this.nextButton.type = 'button';
+    this.nextButton.hidden = true;
+    this.nextButton.addEventListener('click', () => this.handlers.onReviewNext());
+    actions.append(this.undoButton, this.nextButton, restart);
 
     this.notice = el('p', 'notice');
     this.notice.setAttribute('role', 'status');
@@ -149,6 +162,12 @@ export class Hud {
 
     panel.append(this.turnPill, this.connectRow, lastMoveRow, movesRow, actions, this.notice);
     this.root.append(panel);
+    this.activity = el('div', 'move-activity');
+    this.activity.setAttribute('role', 'status');
+    this.activity.hidden = true;
+    this.turnBanner = el('div', 'turn-banner');
+    this.turnBanner.setAttribute('aria-live', 'polite');
+    this.root.append(this.activity, this.turnBanner);
 
     // --- Result banner --------------------------------------------------
     this.resultBanner = el('div', 'result-banner');
@@ -164,8 +183,10 @@ export class Hud {
     this.root.append(this.resultBanner);
   }
 
-  setMode(mode: 'local' | 'online'): void {
-    this.restartButton.textContent = mode === 'online' ? '再来一局' : '重启';
+  setMode(mode: 'local' | 'online' | 'review'): void {
+    this.restartButton.textContent = mode === 'review' ? '返回对局' : mode === 'online' ? '再来一局' : '新对局';
+    this.undoButton.textContent = mode === 'review' ? '上一手' : '悔棋';
+    this.nextButton.hidden = mode !== 'review';
     for (const [id, button] of this.modeButtons) {
       button.classList.toggle('is-active', id === mode);
       button.setAttribute('aria-pressed', String(id === mode));
@@ -220,24 +241,36 @@ export class Hud {
   update(snapshot: GameStatusSnapshot): void {
     this.updateTurn(snapshot.sideToMove, snapshot);
     this.movesValue.textContent = String(Math.floor(snapshot.moveCount / 2) + 1);
-    this.undoButton.disabled = !snapshot.canUndo || snapshot.mode === 'online';
+    this.undoButton.disabled = snapshot.mode === 'review' ? snapshot.reviewPly === 0 :
+      !snapshot.canUndo || (snapshot.mode === 'online' && (snapshot.onlineSide === null || !snapshot.connected || !snapshot.ready));
+    this.nextButton.disabled = snapshot.reviewPly >= snapshot.totalMoves;
+    this.activity.hidden = !snapshot.selection && !snapshot.lastMove && snapshot.mode !== 'review';
+    this.activity.dataset.selected = String(!!snapshot.selection);
+    this.activity.textContent = snapshot.selection ?? (snapshot.mode === 'review'
+      ? `复盘 · 第 ${snapshot.reviewPly} / ${snapshot.totalMoves} 手${snapshot.lastMove ? ` · ${snapshot.lastMove.text}` : ''}`
+      : `刚刚 · ${snapshot.lastMove?.text ?? ''}`);
     // A fresh game has no last move; keep the row from showing whatever the
     // previous game ended on.
     this.moveText.textContent = snapshot.lastMove?.text || EMPTY_MOVE_TEXT;
 
     const { status } = snapshot;
     this.restartButton.disabled = snapshot.mode === 'online' &&
-      (status.kind === 'playing' || snapshot.onlineSide === null || !snapshot.connected);
-    this.resultBanner.hidden = status.kind === 'playing';
-    if (status.kind === 'checkmate') {
+      (!snapshot.result || snapshot.onlineSide === null || !snapshot.connected);
+    const result = snapshot.result;
+    this.resultBanner.hidden = snapshot.mode === 'review' || (!result && status.kind === 'playing');
+    if (result) {
+      const reasons = { checkmate: '绝杀', stalemate: '困毙', repetition: '三次重复', 'no-capture': '久无吃子', resign: '认输', timeout: '超时' };
+      this.showResult(result.winner === null ? '和棋' : `${result.winner === RED ? '红方' : '黑方'}胜`, reasons[result.reason]);
+    }
+    if (!result && status.kind === 'checkmate') {
       const winner = status.winner === RED ? '红方' : '黑方';
       this.showResult(`${winner}胜`, '绝杀');
-    } else if (status.kind === 'stalemate') {
+    } else if (!result && status.kind === 'stalemate') {
       const winner = status.winner === RED ? '红方' : '黑方';
       this.showResult(`${winner}胜`, '困毙');
-    } else if (status.kind === 'repetition') {
+    } else if (!result && status.kind === 'repetition') {
       this.showResult('和棋', '三次重复');
-    } else if (status.kind === 'no-capture') {
+    } else if (!result && status.kind === 'no-capture') {
       this.showResult('和棋', '久无吃子');
     }
 
@@ -258,7 +291,17 @@ export class Hud {
     if (snapshot.mode === 'online' && snapshot.onlineSide !== null) {
       label += snapshot.onlineSide === sideToMove ? ' · 你' : ' · 对手';
     }
+    if (snapshot.mode === 'review') label = '棋谱复盘';
     this.turnText.textContent = label;
+    const key = `${snapshot.mode}:${snapshot.moveCount}:${sideToMove}:${snapshot.result?.reason ?? ''}`;
+    if (this.previousTurn && this.previousTurn !== key && snapshot.mode !== 'review' && !snapshot.result) {
+      this.turnBanner.textContent = snapshot.status.kind === 'playing' && snapshot.status.check ? `${label} · 将军` : label;
+      this.turnBanner.dataset.side = red ? 'red' : 'black';
+      this.turnBanner.classList.remove('is-announcing');
+      void this.turnBanner.offsetWidth;
+      this.turnBanner.classList.add('is-announcing');
+    }
+    this.previousTurn = key;
   }
 
   private showResult(title: string, subtitle: string): void {

@@ -184,7 +184,7 @@ export function createMoveMarker(): THREE.Mesh {
 }
 
 /** Larger ring used to flag the last move's origin and destination. */
-export function createLastMoveMarker(color = PALETTE.vermilion): THREE.Mesh {
+export function createLastMoveMarker(color: number = PALETTE.vermilion): THREE.Mesh {
   const geometry = new THREE.RingGeometry(PIECE_RADIUS * 0.95, PIECE_RADIUS * 1.06, 48);
   const material = new THREE.MeshBasicMaterial({
     color,

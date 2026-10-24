@@ -1,481 +1,265 @@
-import { CloseCode, Room, type Client } from '@colyseus/core';
-import {
-  BLACK,
-  RED,
-  Position,
-  XIANGQI,
-  getVariant,
-  toChineseNotation,
-  type Color,
-  type GameStatus,
-} from '@xiangqi/rules';
+import { CloseCode, Room, ServerError, type Client } from '@colyseus/core';
+import { BLACK, RED, appendRecord, createRecord, replayRecord, type Color, type GameRecord, type Position } from '@xiangqi/rules';
+import { MatchStore, newSeatToken, tokenHash, type PlayerSeat, type StoredMatch } from './storage/matches.ts';
 
-/**
- * Authoritative xiangqi room.
- *
- * The server owns the only Position instance that matters: every move is
- * validated here, and clients only ever receive FEN snapshots plus the move
- * that produced them. That keeps the wire format tiny and makes it impossible
- * for a modified client to play an illegal move.
- *
- * The room deliberately has no @colyseus/schema state. `Room` only pushes a
- * full state when `this.state` is set, and the default serializer is "none",
- * so the wire protocol here is plain messages — no schema version coupling
- * between client and server.
- */
+export type Seat = PlayerSeat | 'spectator';
+export interface RoomOptions { code?: string; variantId?: string; initialClockMs?: number; incrementMs?: number }
+interface JoinOptions { displayName?: unknown; resumeToken?: unknown }
+interface Player { seat: Seat; name: string; token: string | null; connected: boolean }
+interface UndoRequest { seat: PlayerSeat; ply: number; count: number }
+const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const randomCode = () => Array.from({ length: 4 }, () => alphabet[Math.floor(Math.random() * alphabet.length)]).join('');
 
-export type Seat = 'red' | 'black' | 'spectator';
-
-export interface RoomOptions {
-  /** Room code players share. Generated when omitted. */
-  code?: string;
-  variantId?: string;
-  /** Clock budget per side in milliseconds. 0 disables the clock. */
-  initialClockMs?: number;
-  incrementMs?: number;
-}
-
-interface PlayerRecord {
-  sessionId: string;
-  seat: Seat;
-  displayName: string;
-}
-
-export interface SeatNames {
-  red: string | null;
-  black: string | null;
-}
-
-export interface Clocks {
-  red: number;
-  black: number;
-}
-
-/** Wire messages, server -> client. */
-export interface SnapshotMessage {
-  type: 'snapshot';
-  fen: string;
-  sideToMove: Color;
-  status: GameStatus;
-  lastMove: string | null;
-  notation: string;
-  moveNumber: number;
-  seats: SeatNames;
-  clocks: Clocks;
-  gameOver: boolean;
-}
-
-export interface SeatsMessage {
-  type: 'seats';
-  seats: SeatNames;
-  spectators: number;
-  yourSeat: Seat;
-}
-
-export interface MoveMessage {
-  type: 'move';
-  uci: string;
-  notation: string;
-  fen: string;
-  sideToMove: Color;
-  status: GameStatus;
-  moveNumber: number;
-  clocks: Clocks;
-  gameOver: boolean;
-}
-
-export interface RejectMessage {
-  type: 'reject';
-  reason: string;
-}
-
-export interface ChatMessage {
-  type: 'chat';
-  from: string;
-  body: string;
-  at: number;
-}
-
-/**
- * Clock defaults. Zero disables the clock entirely — the client has no clock
- * UI yet, so a silent forfeit on time would be surprising. Both values can be
- * enabled per room through the join/create options.
- */
-const DEFAULT_CLOCK_MS = 0;
-const DEFAULT_INCREMENT_MS = 0;
-const MAX_CHAT_LENGTH = 160;
-const RECONNECT_GRACE_SECONDS = 30;
-/** Two players plus a handful of spectators. */
-const MAX_CLIENTS = 8;
-
-const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-
-function randomCode(): string {
-  let code = '';
-  for (let i = 0; i < 4; i++) {
-    code += CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)];
-  }
-  return code;
-}
-
+/** Durable authority: moves and reserved seats survive room disposal and restart. */
 export class XiangqiRoom extends Room {
-  /** Shared room code. Doubles as the room id so `joinById(code)` works. */
   public code = '';
-  public variantId = XIANGQI.id;
-
+  private store = new MatchStore();
+  private saved!: StoredMatch;
   private position!: Position;
-  private players = new Map<string, PlayerRecord>();
-  private lastMoveUci: string | null = null;
-  private lastNotation = '';
-  private moveNumber = 0;
-  private initialClockMs = DEFAULT_CLOCK_MS;
-  private incrementMs = DEFAULT_INCREMENT_MS;
-  private clocks: Clocks = { red: DEFAULT_CLOCK_MS, black: DEFAULT_CLOCK_MS };
+  private players = new Map<string, Player>();
+  private undoRequest: UndoRequest | null = null;
+  private rematchVotes = new Set<Seat>();
   private clockStartedAt = 0;
-  /** True while a side's clock is actually counting; `clockStartedAt` is 0 otherwise. */
-  private clockArmed = false;
-  private clockSide: Color = RED;
-  private clockTimer: NodeJS.Timeout | null = null;
-  private rematchVotes = new Set<string>();
-  /** Set once a game end has been announced, so it is announced once only. */
-  private settled = false;
+  private clockTimer: ReturnType<typeof setInterval> | null = null;
 
   override onCreate(options: RoomOptions = {}): void {
-    this.variantId = options.variantId ?? XIANGQI.id;
-    this.position = new Position(getVariant(this.variantId));
-
-    this.code = (options.code ?? randomCode()).toUpperCase();
-    // Allowed during onCreate(): the code doubles as the joinable room id.
+    if (options.code) {
+      this.code = options.code.trim().toUpperCase();
+      const saved = this.store.load(this.code);
+      if (!saved) throw new ServerError(404, '房间不存在或存档已删除');
+      this.saved = saved;
+    } else {
+      do { this.code = randomCode(); } while (this.store.load(this.code));
+      const initialClockMs = Math.max(0, Number(options.initialClockMs) || 0);
+      this.saved = { version: 1, code: this.code, record: createRecord(newSeatToken(), options.variantId),
+        reservations: {}, initialClockMs, incrementMs: Math.max(0, Number(options.incrementMs) || 0),
+        clocks: { red: initialClockMs, black: initialClockMs }, clockHistory: [] };
+      this.store.save(this.saved);
+    }
+    this.position = replayRecord(this.saved.record);
     this.roomId = this.code;
-
-    this.initialClockMs = Math.max(0, options.initialClockMs ?? DEFAULT_CLOCK_MS);
-    this.incrementMs = Math.max(0, options.incrementMs ?? DEFAULT_INCREMENT_MS);
-    this.clocks = { red: this.initialClockMs, black: this.initialClockMs };
-    this.clockStartedAt = 0;
-    this.clockSide = RED;
-
-    this.maxClients = MAX_CLIENTS;
-    this.autoDispose = true;    this.onMessage('move', (client, payload: { uci?: unknown }) => {
-      this.handleMove(client, payload);
-    });
-    this.onMessage('rematch', (client) => {
-      this.handleRematch(client);
-    });
-    this.onMessage('chat', (client, payload: { body?: unknown }) => {
-      this.handleChat(client, payload);
-    });
-    this.onMessage('resign', (client) => {
-      this.handleResign(client);
-    });
-    // A client can miss the messages sent during `onJoin` — it has no handler
-    // attached until the join promise resolves. Asking for a sync re-sends the
-    // full picture, which makes joining race-free.
-    this.onMessage('sync', (client) => {
-      this.sendSeats(client);
-      this.sendSnapshot(client);
+    this.maxClients = 8;
+    this.autoDispose = true;
+    this.onMessage('sync', client => { this.sendIdentity(client); this.broadcastSeats(); this.sendSnapshot(client); });
+    this.onMessage('move', (client, message) => this.move(client, message?.uci));
+    this.onMessage('undo-request', client => this.requestUndo(client));
+    this.onMessage('undo-answer', (client, message) => this.answerUndo(client, message?.accept === true));
+    this.onMessage('resign', client => this.resign(client));
+    this.onMessage('rematch', client => this.rematch(client));
+    this.onMessage('chat', (client, message) => {
+      if (typeof message?.body === 'string') this.broadcast('chat', {
+        from: this.players.get(client.sessionId)?.name ?? '棋友', body: message.body.trim().slice(0, 160),
+      });
     });
   }
 
-  override onJoin(client: Client, options: { displayName?: unknown } = {}): void {
-    const displayName =
-      typeof options.displayName === 'string' && options.displayName.trim().length > 0
-        ? options.displayName.trim().slice(0, 24)
-        : `棋友${client.sessionId.slice(0, 4)}`;
-
-    const seat = this.assignSeat();
-    this.players.set(client.sessionId, { sessionId: client.sessionId, seat, displayName });
-
+  override onJoin(client: Client, options: JoinOptions = {}): void {
+    const name = typeof options.displayName === 'string' && options.displayName.trim()
+      ? options.displayName.trim().slice(0, 24) : '棋友';
+    let seat: Seat = 'spectator';
+    let token: string | null = null;
+    if (typeof options.resumeToken === 'string' && options.resumeToken) {
+      token = options.resumeToken;
+      const hash = tokenHash(token);
+      seat = (['red', 'black'] as const).find(side => this.saved.reservations[side]?.tokenHash === hash) ?? 'spectator';
+      if (seat === 'spectator') throw new ServerError(403, '续局凭据无效');
+      if ([...this.players.values()].some(player => player.seat === seat && player.connected)) {
+        throw new ServerError(409, '该座位已在另一页面，请先关闭原对局');
+      }
+    } else {
+      seat = !this.saved.reservations.red ? 'red' : !this.saved.reservations.black ? 'black' : 'spectator';
+      if (seat !== 'spectator') {
+        token = newSeatToken();
+        const next = structuredClone(this.saved);
+        next.reservations[seat] = { name, tokenHash: tokenHash(token) };
+        this.commit(next);
+      }
+    }
+    this.players.set(client.sessionId, { seat, name: seat === 'spectator' ? name : this.saved.reservations[seat]!.name,
+      token, connected: true });
+    this.sendIdentity(client);
     this.broadcastSeats();
     this.sendSnapshot(client);
-    this.broadcast('event', { type: 'joined', name: displayName, seat });
-
-    // The first player to sit down starts the clock running.
-    if (seat === 'red' && !this.clockArmed && this.initialClockMs > 0) {
-      this.startClock(RED);
-    }
+    this.armClock();
   }
 
   override onLeave(client: Client, code?: number): void {
     const player = this.players.get(client.sessionId);
     if (!player) return;
-
-    this.broadcast('event', { type: 'left', name: player.displayName, seat: player.seat });
-
-    if (code === CloseCode.CONSENTED) {
+    player.connected = false;
+    if (player.seat !== 'spectator') {
+      this.pauseClock();
+      this.cancelUndo();
+    }
+    this.broadcastSeats();
+    // Leaving pauses a game, never forfeits it. The durable seat stays reserved.
+    if (code === CloseCode.CONSENTED) { this.players.delete(client.sessionId); return; }
+    void this.allowReconnection(client, 30).then(reconnected => {
       this.players.delete(client.sessionId);
+      // A manual history resume may already have reclaimed the seat.
+      if ([...this.players.values()].some(p => p.seat === player.seat && p.connected && player.seat !== 'spectator')) {
+        void reconnected.leave();
+        return;
+      }
+      this.players.set(reconnected.sessionId, { ...player, connected: true });
+      this.sendIdentity(reconnected);
       this.broadcastSeats();
-      return;
-    }
-
-    // Keep the seat warm for a short reconnect window instead of forfeiting.
-    void this.allowReconnection(client, RECONNECT_GRACE_SECONDS)
-      .then((reconnected) => {
-        this.players.delete(client.sessionId);
-        this.players.set(reconnected.sessionId, { ...player, sessionId: reconnected.sessionId });
-        this.broadcastSeats();
-        this.sendSnapshot(reconnected);
-      })
-      .catch(() => {
-        this.players.delete(client.sessionId);
-        this.broadcastSeats();
-        // Losing a player mid-game is a forfeit for the side that stayed.
-        if (player.seat !== 'spectator' && this.position.status().kind === 'playing') {
-          const loser = player.seat === 'red' ? RED : BLACK;
-          this.settled = true;
-          this.stopClock();
-          this.broadcast('event', {
-            type: 'forfeit',
-            name: player.displayName,
-            loser,
-            winner: loser === RED ? BLACK : RED,
-          });
-        }
-      });
+      this.sendSnapshot(reconnected);
+      this.armClock();
+    }).catch(() => { this.players.delete(client.sessionId); this.broadcastSeats(); });
   }
 
-  override onDispose(): void {
-    this.stopClock();
+  override onDispose(): void { this.pauseClock(); }
+
+  private commit(next: StoredMatch): void {
+    // Persist before publishing: clients never see a move that failed to save.
+    this.store.save(next);
+    this.saved = next;
+    this.position = replayRecord(next.record);
   }
-
-  // -- Seating -------------------------------------------------------------
-
-  private seatTaken(seat: Seat): boolean {
-    for (const record of this.players.values()) {
-      if (record.seat === seat) return true;
-    }
-    return false;
+  private ready(): boolean {
+    return (['red', 'black'] as const).every(side => [...this.players.values()].some(p => p.seat === side && p.connected));
   }
-
-  private assignSeat(): Seat {
-    if (!this.seatTaken('red')) return 'red';
-    if (!this.seatTaken('black')) return 'black';
-    return 'spectator';
+  private snapshot() {
+    const record = this.saved.record;
+    const last = record.moves.at(-1);
+    return { fen: this.position.fen(), sideToMove: this.position.sideToMove, status: this.position.status(),
+      record, lastMove: last?.uci ?? null, notation: last?.notation ?? '', moveNumber: record.moves.length,
+      gameOver: !!record.result, clocks: this.currentClocks(), ready: this.ready(), undo: this.undoRequest };
   }
-
-  /** Name sitting in each seat, for the client's player labels. */
-  private seatNames(): SeatNames {
-    let red: string | null = null;
-    let black: string | null = null;
-    for (const record of this.players.values()) {
-      if (record.seat === 'red') red = record.displayName;
-      else if (record.seat === 'black') black = record.displayName;
-    }
-    return { red, black };
+  private sendSnapshot(client: Client): void { client.send('snapshot', this.snapshot()); }
+  private broadcastSnapshot(type = 'snapshot', extra = {}): void { this.broadcast(type, { ...this.snapshot(), ...extra }); }
+  private sendIdentity(client: Client): void {
+    const player = this.players.get(client.sessionId);
+    if (player) client.send('identity', { gameId: this.saved.record.id, code: this.code,
+      seat: player.seat, resumeToken: player.token });
   }
-
-  private seatOf(sessionId: string): Seat {
-    return this.players.get(sessionId)?.seat ?? 'spectator';
-  }
-
-  private spectatorCount(): number {
-    let count = 0;
-    for (const record of this.players.values()) {
-      if (record.seat === 'spectator') count += 1;
-    }
-    return count;
-  }
-
-  private sendSeats(client: Client): void {
-    const message: SeatsMessage = {
-      type: 'seats',
-      seats: this.seatNames(),
-      spectators: this.spectatorCount(),
-      yourSeat: this.seatOf(client.sessionId),
-    };
-    client.send('seats', message);
-  }
-
   private broadcastSeats(): void {
-    for (const client of this.clients) this.sendSeats(client);
+    const seats = { red: this.saved.reservations.red?.name ?? null, black: this.saved.reservations.black?.name ?? null };
+    const spectators = [...this.players.values()].filter(p => p.connected && p.seat === 'spectator').length;
+    for (const client of this.clients) client.send('seats', { seats, spectators,
+      yourSeat: this.players.get(client.sessionId)?.seat ?? 'spectator', ready: this.ready() });
   }
-
-  // -- Clock ---------------------------------------------------------------
-
-  /** Whether clocks are in use for this room at all. */
-  private clockEnabled(): boolean {
-    return this.initialClockMs > 0 && this.position.status().kind === 'playing';
-  }
-
-  private elapsedFor(side: Color): number {
-    if (!this.clockArmed || !this.clockEnabled()) return 0;
-    if (this.clockSide !== side) return 0;
-    return Math.max(0, Date.now() - this.clockStartedAt);
-  }
-
-  private currentClocks(): Clocks {
-    return {
-      red: Math.max(0, this.clocks.red - this.elapsedFor(RED)),
-      black: Math.max(0, this.clocks.black - this.elapsedFor(BLACK)),
-    };
-  }
-
-  private startClock(side: Color): void {
-    this.stopClock();
-    if (!this.clockEnabled()) return;
-    this.clockSide = side;
-    this.clockStartedAt = Date.now();
-    this.clockArmed = true;
-    this.clockTimer = setInterval(() => {
-      const clocks = this.currentClocks();
-      const remaining = side === RED ? clocks.red : clocks.black;
-      if (remaining > 0) return;
+  private reject(client: Client, reason: string): void { client.send('reject', { reason }); }
+  private move(client: Client, uci: unknown): void {
+    const player = this.players.get(client.sessionId);
+    if (!player || player.seat === 'spectator') return this.reject(client, '观战者不能走子');
+    if (!this.ready()) return this.reject(client, '等待对手回到棋局');
+    if (this.saved.record.result) return this.reject(client, '对局已结束');
+    if ((player.seat === 'red' ? RED : BLACK) !== this.position.sideToMove) return this.reject(client, '还没轮到你');
+    if (typeof uci !== 'string') return this.reject(client, '着法格式不正确');
+    try {
+      const next = structuredClone(this.saved);
+      next.record = appendRecord(next.record, uci);
+      const before = this.currentClocks();
+      if (next.initialClockMs > 0 && before[player.seat] <= 0) return this.finish('timeout', player.seat === 'red' ? BLACK : RED);
+      next.clockHistory.push(before);
+      next.clocks = { ...before, [player.seat]: before[player.seat] + next.incrementMs };
+      this.commit(next);
       this.stopClock();
-      const winner = side === RED ? BLACK : RED;
-      this.settled = true;
-      this.broadcast('event', { type: 'timeout', winner });
-    }, 1000);
+      this.cancelUndo();
+      this.broadcastSnapshot('move', { uci });
+      this.armClock();
+    } catch (error) { this.reject(client, error instanceof Error ? error.message : '保存失败，请重试'); }
   }
-
-  private stopClock(): void {
-    if (this.clockTimer) clearInterval(this.clockTimer);
-    this.clockTimer = null;
-    this.clockArmed = false;
-    this.clockStartedAt = 0;
+  private requestUndo(client: Client): void {
+    const seat = this.players.get(client.sessionId)?.seat;
+    const ply = this.saved.record.moves.length;
+    if (!seat || seat === 'spectator' || !this.ready() || !ply || this.undoRequest) return this.reject(client, '当前不能请求悔棋');
+    const mover = ply % 2 ? 'red' : 'black';
+    const count = mover === seat ? 1 : 2;
+    if (count > ply) return this.reject(client, '还没有可撤回的着法');
+    this.undoRequest = { seat, ply, count };
+    this.broadcast('undo-pending', this.undoRequest);
   }
-
-  private commitClock(): void {
-    if (!this.clockArmed || !this.clockEnabled()) return;
-    const elapsed = this.elapsedFor(this.clockSide);
-    if (this.clockSide === RED) {
-      this.clocks = { red: Math.max(0, this.clocks.red - elapsed), black: this.clocks.black };
-    } else {
-      this.clocks = { red: this.clocks.red, black: Math.max(0, this.clocks.black - elapsed) };
-    }
-  }
-
-  // -- Moves ---------------------------------------------------------------
-
-  private handleMove(client: Client, payload: { uci?: unknown }): void {
-    const seat = this.seatOf(client.sessionId);
-    if (seat === 'spectator') {
-      this.reject(client, '观战者不能走子');
-      return;
-    }
-    const uci = payload?.uci;
-    if (typeof uci !== 'string' || uci.length < 4 || uci.length > 5) {
-      this.reject(client, '着法格式不正确');
-      return;
-    }
-    if (this.settled || this.position.status().kind !== 'playing') {
-      this.reject(client, '对局已结束');
-      return;
-    }
-    const seatSide: Color = seat === 'red' ? RED : BLACK;
-    if (this.position.sideToMove !== seatSide) {
-      this.reject(client, '还没轮到你');
-      return;
-    }
-
-    const move = this.position.findUciMove(uci);
-    if (move < 0) {
-      this.reject(client, '不合规则的着法');
-      return;
-    }
-
-    const notation = toChineseNotation(this.position, move);
-    this.commitClock();
-    this.position.makeMove(move);
-    this.lastMoveUci = uci;
-    this.lastNotation = notation;
-    this.moveNumber += 1;
-
-    // Fischer increment goes to the player who just moved.
-    if (this.initialClockMs > 0) {
-      if (seatSide === RED) this.clocks.red += this.incrementMs;
-      else this.clocks.black += this.incrementMs;
-    }
-
-    const status = this.position.status();
-    const message: MoveMessage = {
-      type: 'move',
-      uci,
-      notation,
-      fen: this.position.fen(),
-      sideToMove: this.position.sideToMove,
-      status,
-      moveNumber: this.moveNumber,
-      clocks: this.currentClocks(),
-      gameOver: status.kind !== 'playing',
-    };
-    this.broadcast('move', message);
-
-    if (message.gameOver) {
-      this.settled = true;
+  private answerUndo(client: Client, accept: boolean): void {
+    const seat = this.players.get(client.sessionId)?.seat;
+    const request = this.undoRequest;
+    if (!request || !seat || seat === 'spectator' || seat === request.seat) return;
+    if (!accept || !this.ready() || request.ply !== this.saved.record.moves.length) { this.cancelUndo('对手拒绝了悔棋'); return; }
+    try {
+      const next = structuredClone(this.saved);
+      const length = next.record.moves.length - request.count;
+      next.record.moves.length = length;
+      next.record.result = null;
+      next.record.updatedAt = Date.now();
+      next.clocks = next.clockHistory[length] ?? { red: next.initialClockMs, black: next.initialClockMs };
+      next.clockHistory.length = length;
+      this.commit(next);
       this.stopClock();
-      this.rematchVotes.clear();
-    } else {
-      this.startClock(this.position.sideToMove);
-    }
+      this.cancelUndo('已撤回着法');
+      this.broadcastSnapshot();
+      this.armClock();
+    } catch { this.reject(client, '保存失败，悔棋未生效'); }
   }
-
-  private handleResign(client: Client): void {
-    const seat = this.seatOf(client.sessionId);
-    if (seat === 'spectator' || this.settled) return;
-    const loser = seat === 'red' ? RED : BLACK;
-    this.settled = true;
-    this.stopClock();
-    this.broadcast('event', { type: 'resign', loser, winner: loser === RED ? BLACK : RED });
+  private cancelUndo(text = ''): void {
+    if (!this.undoRequest) return;
+    this.undoRequest = null;
+    this.broadcast('undo-cleared', { text });
   }
-
-  private handleRematch(client: Client): void {
-    if (this.seatOf(client.sessionId) === 'spectator') return;
-    this.rematchVotes.add(client.sessionId);
-    const seated = [...this.players.values()].filter((p) => p.seat !== 'spectator');
-    // Everyone seated must agree, and the game must actually be over.
-    if (this.position.status().kind === 'playing') return;
-    if (seated.length < 2) return;
-    if (this.rematchVotes.size < seated.length) {
-      this.broadcast('event', { type: 'rematch-pending', votes: this.rematchVotes.size });
+  private resign(client: Client): void {
+    const seat = this.players.get(client.sessionId)?.seat;
+    if (!seat || seat === 'spectator' || this.saved.record.result) return;
+    this.finish('resign', seat === 'red' ? BLACK : RED);
+  }
+  private finish(reason: 'resign' | 'timeout', winner: Color): void {
+    const next = structuredClone(this.saved);
+    next.record.result = { reason, winner };
+    next.record.updatedAt = Date.now();
+    next.clocks = this.currentClocks();
+    try { this.commit(next); }
+    catch (error) {
+      this.stopClock();
+      console.error('Could not save game result', error);
+      this.broadcast('event', { type: 'storage-error' });
       return;
     }
-    this.resetGame();
-    this.broadcast('event', { type: 'rematch' });
-  }
-
-  private resetGame(): void {
     this.stopClock();
-    this.position.setFen(this.position.config.startFen);
-    this.lastMoveUci = null;
-    this.lastNotation = '';
-    this.moveNumber = 0;
-    this.clocks = { red: this.initialClockMs, black: this.initialClockMs };
+    this.cancelUndo();
+    this.broadcastSnapshot();
+  }
+  private rematch(client: Client): void {
+    const seat = this.players.get(client.sessionId)?.seat;
+    if (!seat || seat === 'spectator' || !this.saved.record.result || !this.ready()) return;
+    this.rematchVotes.add(seat);
+    if (this.rematchVotes.size < 2) { this.broadcast('event', { type: 'rematch-pending' }); return; }
+    try {
+      const next = structuredClone(this.saved);
+      // Archive the completed game before reusing the table and seat keys.
+      const archive = new MatchStore(`${this.store.directory}/archive/${next.record.id}`);
+      archive.save(next);
+      next.record = createRecord(newSeatToken(), next.record.variantId);
+      next.clocks = { red: next.initialClockMs, black: next.initialClockMs };
+      next.clockHistory = [];
+      this.commit(next);
+    } catch { this.reject(client, '保存失败，新对局未开始'); return; }
+    this.stopClock();
     this.rematchVotes.clear();
-    this.settled = false;
-    this.startClock(RED);
-    this.broadcast('reset', { fen: this.position.fen() });
+    for (const client of this.clients) this.sendIdentity(client);
+    this.broadcastSnapshot('reset');
+    this.armClock();
   }
-
-  private handleChat(client: Client, payload: { body?: unknown }): void {
-    const body = payload?.body;
-    if (typeof body !== 'string') return;
-    const trimmed = body.trim().slice(0, MAX_CHAT_LENGTH);
-    if (trimmed.length === 0) return;
-    const name = this.players.get(client.sessionId)?.displayName ?? '棋友';
-    const message: ChatMessage = { type: 'chat', from: name, body: trimmed, at: Date.now() };
-    this.broadcast('chat', message);
+  private currentClocks() {
+    const clocks = { ...this.saved.clocks };
+    if (this.clockStartedAt && !this.saved.record.result) {
+      const side = this.position.sideToMove === RED ? 'red' : 'black';
+      clocks[side] = Math.max(0, clocks[side] - (Date.now() - this.clockStartedAt));
+    }
+    return clocks;
   }
-
-  // -- Snapshots -----------------------------------------------------------
-
-  private sendSnapshot(client: Client): void {
-    const status = this.position.status();
-    const message: SnapshotMessage = {
-      type: 'snapshot',
-      fen: this.position.fen(),
-      sideToMove: this.position.sideToMove,
-      status,
-      lastMove: this.lastMoveUci,
-      notation: this.lastNotation,
-      moveNumber: this.moveNumber,
-      seats: this.seatNames(),
-      clocks: this.currentClocks(),
-      gameOver: this.settled || status.kind !== 'playing',
-    };
-    client.send('snapshot', message);
+  private stopClock(): void { if (this.clockTimer) clearInterval(this.clockTimer); this.clockTimer = null; this.clockStartedAt = 0; }
+  private pauseClock(): void {
+    if (!this.clockStartedAt) return;
+    const next = { ...this.saved, clocks: this.currentClocks() };
+    this.stopClock();
+    try { this.commit(next); } catch (error) { console.error('Clock checkpoint failed', error); }
   }
-
-  private reject(client: Client, reason: string): void {
-    const message: RejectMessage = { type: 'reject', reason };
-    client.send('reject', message);
+  private armClock(): void {
+    if (this.clockStartedAt || !this.ready() || this.saved.record.result || !this.saved.initialClockMs) return;
+    this.clockStartedAt = Date.now();
+    this.clockTimer = setInterval(() => {
+      const side = this.position.sideToMove === RED ? 'red' : 'black';
+      if (this.currentClocks()[side] <= 0) this.finish('timeout', side === 'red' ? BLACK : RED);
+    }, 250);
   }
 }

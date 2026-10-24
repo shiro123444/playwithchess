@@ -1,5 +1,5 @@
 import { ColyseusSDK, type Room } from '@colyseus/sdk';
-import { BLACK, RED, type Color, type GameStatus } from '@xiangqi/rules';
+import { BLACK, RED, type Color, type GameStatus, type GameRecord } from '@xiangqi/rules';
 
 /**
  * Online transport for the authoritative server.
@@ -31,15 +31,19 @@ export interface OnlineHandlers {
   onRoom: (state: RoomState) => void;
   /** Transient roster/rematch chatter, shown as a short notice. */
   onNotice: (text: string) => void;
-  onPosition: (fen: string, lastMoveUci: string | null, notation: string) => void;
   /** Seat this client holds; `null` means spectator. */
   onSide: (side: Color | null) => void;
   /** The room is gone (closed by the server, or dropped for good). */
   onClosed: () => void;
   onConnection: (connected: boolean) => void;
+  onRecord: (record: GameRecord) => void;
+  onIdentity?: (identity: { code: string; gameId: string; seat: 'red' | 'black' | 'spectator'; resumeToken: string | null }) => void;
+  onUndo?: (request: { seat: 'red' | 'black'; ply: number; count: number } | null) => void;
 }
 
 interface SnapshotMessage {
+  record?: GameRecord;
+  ready?: boolean;
   fen: string;
   sideToMove: Color;
   status: GameStatus;
@@ -52,6 +56,7 @@ interface SnapshotMessage {
 }
 
 interface MoveMessage {
+  record?: GameRecord;
   uci: string;
   notation: string;
   fen: string;
@@ -66,6 +71,7 @@ interface SeatsMessage {
   seats: SeatNames;
   spectators: number;
   yourSeat: 'red' | 'black' | 'spectator';
+  ready?: boolean;
 }
 
 interface RejectMessage {
@@ -113,6 +119,8 @@ export class OnlineSession {
   private seats: SeatNames = { red: null, black: null };
   private spectators = 0;
   private cancelled = false;
+  private ready = false;
+  private syncing = true;
 
   constructor(private readonly handlers: OnlineHandlers) {
     this.sdk = new ColyseusSDK(resolveServerUrl());
@@ -134,7 +142,7 @@ export class OnlineSession {
   /**
    * Join an existing room by code, or create a fresh table without a code.
    */
-  async connect(code?: string | null): Promise<void> {
+  async connect(code?: string | null, resumeToken?: string): Promise<void> {
     if (this.room) return;
     this.handlers.onStatus('连接中', 'idle');
 
@@ -142,12 +150,21 @@ export class OnlineSession {
     const options = {
       displayName: displayName(),
       variantId: 'xiangqi',
+      ...(resumeToken ? { resumeToken } : {}),
     };
     // Creating always makes a private table; entering a code never silently
     // creates a new room when the invitation is mistyped or expired.
-    const room = requested
-      ? await this.sdk.joinById(requested, options)
-      : await this.sdk.create(ROOM_NAME, options);
+    let room: Room;
+    if (!requested) room = await this.sdk.create(ROOM_NAME, options);
+    else {
+      try { room = await this.sdk.joinById(requested, options); }
+      catch (error) {
+        const code = (error as { code?: number }).code;
+        if (code !== 4212 && code !== 404 && code !== 522) throw error;
+        // The server only recreates codes backed by a durable match file.
+        room = await this.sdk.joinOrCreate(ROOM_NAME, { ...options, code: requested });
+      }
+    }
     if (this.cancelled) {
       await room.leave(true);
       return;
@@ -183,6 +200,10 @@ export class OnlineSession {
     this.room?.send('rematch');
   }
 
+  requestUndo(): void { this.room?.send('undo-request'); }
+  answerUndo(accept: boolean): void { this.room?.send('undo-answer', { accept }); }
+  resign(): void { this.room?.send('resign'); }
+
   sendChat(body: string): void {
     this.room?.send('chat', { body });
   }
@@ -190,21 +211,31 @@ export class OnlineSession {
   // -- Wiring --------------------------------------------------------------
 
   private bind(room: Room): void {
+    room.onMessage('identity', message => this.handlers.onIdentity?.(message));
+    room.onMessage('undo-pending', message => this.handlers.onUndo?.(message));
+    room.onMessage('undo-cleared', (message: { text?: string }) => {
+      this.handlers.onUndo?.(null);
+      if (message.text) this.handlers.onNotice(message.text);
+    });
     room.onMessage('snapshot', (message: SnapshotMessage) => {
-      this.handlers.onPosition(message.fen, message.lastMove, message.notation);
+      if (!this.applyRecord(message.record)) return;
+      this.syncing = false;
+      if (typeof message.ready === 'boolean') this.ready = message.ready;
+      this.handlers.onRoom(this.roomState());
     });
 
     room.onMessage('move', (message: MoveMessage) => {
-      this.handlers.onPosition(message.fen, message.uci, message.notation);
+      this.applyRecord(message.record);
     });
 
-    room.onMessage('reset', (message: { fen: string }) => {
-      this.handlers.onPosition(message.fen, null, '');
+    room.onMessage('reset', (message: { fen: string; record?: GameRecord }) => {
+      this.applyRecord(message.record);
       this.handlers.onNotice('新的一局');
     });
 
     room.onMessage('seats', (message: SeatsMessage) => {
       this.seats = message.seats;
+      this.ready = message.ready ?? !!(message.seats.red && message.seats.black);
       this.spectators = message.spectators;
       const next = seatToColor(message.yourSeat);
       if (next !== this.seat) {
@@ -216,6 +247,7 @@ export class OnlineSession {
 
     room.onMessage('reject', (message: RejectMessage) => {
       this.handlers.onStatus(message.reason, 'error');
+      this.handlers.onNotice(message.reason);
       room.send('sync', {});
     });
 
@@ -230,6 +262,7 @@ export class OnlineSession {
     room.onDrop(() => {
       if (this.cancelled) return;
       this.joined = false;
+      this.syncing = true;
       this.handlers.onConnection(false);
       this.handlers.onStatus('连接断开 · 重连中', 'error');
     });
@@ -257,12 +290,23 @@ export class OnlineSession {
     });
   }
 
+  private applyRecord(record?: GameRecord): boolean {
+    if (!record || record.version !== 1) {
+      this.handlers.onNotice('联机服务需要升级，当前版本不支持存档');
+      this.leave();
+      this.handlers.onClosed();
+      return false;
+    }
+    this.handlers.onRecord(record);
+    return true;
+  }
+
   private roomState(): RoomState {
     return {
       code: this.room?.roomId ?? '',
       seats: this.seats,
       spectators: this.spectators,
-      waiting: !(this.seats.red && this.seats.black),
+      waiting: this.syncing || !this.ready,
     };
   }
 
@@ -296,6 +340,9 @@ export class OnlineSession {
         break;
       case 'rematch':
         this.handlers.onNotice('新的一局');
+        break;
+      case 'storage-error':
+        this.handlers.onNotice('服务端保存失败，请稍后重试');
         break;
       default:
         break;

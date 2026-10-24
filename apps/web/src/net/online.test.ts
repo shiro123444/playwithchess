@@ -1,12 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { BLACK } from '@xiangqi/rules';
+import { BLACK, createRecord } from '@xiangqi/rules';
 import { OnlineSession, type OnlineHandlers } from './online.ts';
 
-const sdk = vi.hoisted(() => ({ create: vi.fn(), joinById: vi.fn() }));
+const sdk = vi.hoisted(() => ({ create: vi.fn(), joinById: vi.fn(), joinOrCreate: vi.fn() }));
 vi.mock('@colyseus/sdk', () => ({
   ColyseusSDK: class {
     create = sdk.create;
     joinById = sdk.joinById;
+    joinOrCreate = sdk.joinOrCreate;
   },
 }));
 
@@ -24,11 +25,12 @@ function fixture() {
     onError: (fn: (...args: any[]) => void) => events.set('error', fn),
   };
   const handlers: OnlineHandlers = {
-    onStatus: vi.fn(), onRoom: vi.fn(), onNotice: vi.fn(), onPosition: vi.fn(),
+    onStatus: vi.fn(), onRoom: vi.fn(), onNotice: vi.fn(), onRecord: vi.fn(),
     onSide: vi.fn(), onClosed: vi.fn(), onConnection: vi.fn(),
   };
   sdk.create.mockResolvedValue(room);
   sdk.joinById.mockResolvedValue(room);
+  sdk.joinOrCreate.mockResolvedValue(room);
   return { room, messages, events, handlers, session: new OnlineSession(handlers) };
 }
 
@@ -57,6 +59,7 @@ describe('online room lifecycle', () => {
     const { session, messages, handlers } = fixture();
     await session.connect('ABCD');
     messages.get('seats')!({ seats: { red: 'A', black: 'B' }, spectators: 1, yourSeat: 'black' });
+    messages.get('snapshot')!({ record: createRecord('test'), ready: true });
     expect(session.side).toBe(BLACK);
     expect(handlers.onSide).toHaveBeenCalledWith(BLACK);
     expect(handlers.onRoom).toHaveBeenLastCalledWith({
@@ -105,4 +108,21 @@ describe('online room lifecycle', () => {
     expect(handlers.onClosed).not.toHaveBeenCalled();
     expect(session.isConnected()).toBe(false);
   });
+  it('recreates only a durable room after the live room has been disposed', async () => {
+    const { session } = fixture();
+    sdk.joinById.mockRejectedValue({ code: 4212 });
+    await session.connect('ABCD', 'resume-secret');
+    expect(sdk.joinOrCreate).toHaveBeenCalledWith('xiangqi', expect.objectContaining({ code: 'ABCD', resumeToken: 'resume-secret' }));
+    expect(sdk.create).not.toHaveBeenCalled();
+  });
+  it('keeps input waiting until the authoritative replay arrives', async () => {
+    const { session, messages, handlers } = fixture();
+    await session.connect('ABCD');
+    messages.get('seats')!({ seats: { red: 'A', black: 'B' }, spectators: 0, yourSeat: 'red', ready: true });
+    expect(handlers.onRoom).toHaveBeenLastCalledWith(expect.objectContaining({ waiting: true }));
+    messages.get('snapshot')!({ record: createRecord('test'), ready: true });
+    expect(handlers.onRoom).toHaveBeenLastCalledWith(expect.objectContaining({ waiting: false }));
+    expect(handlers.onRecord).toHaveBeenCalled();
+  });
+
 });

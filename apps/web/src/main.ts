@@ -1,210 +1,211 @@
 import './styles/global.css';
-import { BLACK, RED } from '@xiangqi/rules';
-import { createGame, type GameCue } from './game/game.ts';
+import { BLACK, RED, type GameRecord } from '@xiangqi/rules';
+import { createGame, type GameCue, type ViewPreset } from './game/game.ts';
 import { SoundBoard } from './audio/sound.ts';
 import { Hud } from './ui/hud.ts';
 import { RoomDialog } from './ui/room-dialog.ts';
+import { LibraryDialog } from './ui/library.ts';
+import { GameArchive, type ArchiveEntry } from './storage/archive.ts';
 import type { OnlineSession, RoomState } from './net/online.ts';
 
-type Mode = 'local' | 'online';
-
-const canvas = document.querySelector<HTMLCanvasElement>('#scene');
-const hudHost = document.querySelector<HTMLElement>('#hud');
-const overlayHost = document.querySelector<HTMLElement>('#overlay');
-if (!canvas || !hudHost || !overlayHost) {
-  throw new Error('Missing #scene, #hud or #overlay in the document');
-}
-
+type Mode = 'local' | 'online' | 'review';
+const canvas = document.querySelector<HTMLCanvasElement>('#scene')!;
+const hudHost = document.querySelector<HTMLElement>('#hud')!;
+const overlayHost = document.querySelector<HTMLElement>('#overlay')!;
 const game = createGame({ canvas });
 const sound = new SoundBoard();
-
+canvas.addEventListener('pointerdown', () => sound.unlock(), { capture: true });
+const archive = new GameArchive({ getItem: key => localStorage.getItem(key), setItem: (key, value) => localStorage.setItem(key, value) });
+const library = new LibraryDialog(overlayHost);
 let mode: Mode = 'local';
 let online: OnlineSession | null = null;
-/** Seat the server gave us once the room answered; `null` means spectator. */
 let seat: 'red' | 'black' | 'spectator' | null = null;
+let identity: { code: string; gameId: string; seat: 'red' | 'black' | 'spectator'; resumeToken: string | null } | null = null;
 let lastState: RoomState | null = null;
+let onlineRecord: GameRecord | null = null;
+let localRecord = game.getRecord();
+let reviewEntry: ArchiveEntry | null = null;
+let reviewPly = 0;
 let closeTimer: number | null = null;
 let joinAttempt = 0;
 let connecting = false;
+let storageWarningShown = false;
+let preset: ViewPreset = 'auto';
+try {
+  const stored = localStorage.getItem('xiangqi.view');
+  if (['auto', 'overhead', 'angled', 'low'].includes(stored ?? '')) preset = stored as ViewPreset;
+} catch { /* View changes still work when browser storage is blocked. */ }
 
+function save(entry: ArchiveEntry): void {
+  if (!archive.save(entry) && !storageWarningShown) {
+    storageWarningShown = true;
+    hud.setNotice('存档保存失败，浏览器存储已满或不可用', 'error');
+  }
+}
+function saveOnline(): void {
+  if (!onlineRecord) return;
+  const entry: ArchiveEntry = { record: onlineRecord, mode: 'online', roomCode: lastState?.code ?? identity?.code ?? online?.roomId ?? undefined };
+  if (identity?.gameId === onlineRecord.id) {
+    entry.seat = identity.seat;
+    if (identity.resumeToken) entry.resumeToken = identity.resumeToken;
+  }
+  save(entry);
+}
 const hud = new Hud(hudHost, {
   onUndo: () => {
     sound.play('click');
-    game.undo();
+    if (mode === 'review') stepReview(-1);
+    else if (mode === 'online') online?.requestUndo();
+    else if (game.undo()) hud.setNotice('已撤回上一手');
   },
   onRestart: () => {
     sound.play('click');
-    if (mode === 'online') {
-      online?.requestRematch();
-      hud.setNotice('已请求再来一局');
-    } else game.restart();
+    if (mode === 'review') return exitReview();
+    if (mode === 'online') { online?.requestRematch(); hud.setNotice('已请求再来一局'); }
+    else game.restart();
   },
   onFlip: () => {
-    sound.play('click');
-    game.flipCamera();
+    roomDialog.hide();
+    library.views(preset, next => {
+      preset = next; game.setViewPreset(next);
+      try { localStorage.setItem('xiangqi.view', next); } catch { /* optional preference */ }
+    }, () => game.flipCamera());
   },
-  onModeChange: (next) => {
-    sound.play('click');
-    if (next === 'online') openRoom();
-    else goLocal();
-  },
-  onOpenRoom: () => {
-    sound.play('click');
-    openRoom();
-  },
-  onToggleSound: () => {
-    const enabled = sound.toggle();
-    // Confirm turning it on with the cue itself; mute needs no confirmation.
-    if (enabled) sound.play('click');
-    return enabled;
-  },
+  onHistory: () => { sound.unlock(); roomDialog.hide(); library.history(archive.entries(), resume, review); },
+  onReviewNext: () => stepReview(1),
+  onModeChange: next => { sound.play('click'); if (next === 'online') openRoom(); else goLocal(); },
+  onOpenRoom: () => openRoom(),
+  onToggleSound: () => { const enabled = sound.toggle(); if (enabled) sound.play('click'); return enabled; },
 });
-
 const roomDialog = new RoomDialog(overlayHost, {
-  onEnter: (code) => void enterRoom(code),
-  onLeave: () => goLocal(),
-  onCancel: () => goLocal(),
-  onCopy: (text) => void copyInvite(text),
+  onEnter: code => void enterRoom(code), onLeave: () => goLocal(), onCancel: () => goLocal(),
+  onCopy: async text => {
+    try { await navigator.clipboard.writeText(text); hud.setNotice('邀请已复制'); }
+    catch { hud.setNotice('复制失败', 'error'); }
+  },
 });
-
 hud.setSound(sound.isEnabled);
-
-// --- Online --------------------------------------------------------------
-
 function openRoom(): void {
   if (connecting) return;
-  if (online?.isConnected()) {
-    roomDialog.showWaiting(online.roomId ?? '', lastState?.waiting ?? false, seatText());
-    return;
-  }
-  roomDialog.showEntry();
+  if (online?.isConnected()) roomDialog.showWaiting(online.roomId ?? '', lastState?.waiting ?? true, seatText());
+  else roomDialog.showEntry();
 }
-
-async function enterRoom(code: string | null): Promise<void> {
+async function enterRoom(code: string | null, resumeToken?: string): Promise<void> {
   if (connecting) return;
+  const previous = online; online = null; previous?.leave();
   connecting = true;
   const attempt = ++joinAttempt;
-  const { OnlineSession } = await import('./net/online.ts');
-  if (attempt !== joinAttempt) return;
-  const session = new OnlineSession({
-    onStatus: (text, tone) => hud.setConnection(text, tone),
-    onRoom: (state) => onRoomState(state),
-    onNotice: (text) => hud.setNotice(text),
-    onPosition: (fen, lastMoveUci, notation) => game.setOnlinePosition(fen, lastMoveUci, notation),
-    onSide: (side) => {
-      seat = side === RED ? 'red' : side === BLACK ? 'black' : 'spectator';
-      game.setMode('online', side);
-    },
-    onConnection: (connected) => game.setConnection(connected, !(lastState?.waiting ?? true)),
-    onClosed: () => {
-      if (online === session) goLocal();
-    },
-  });
-  online = session;
+  seat = null; identity = null; onlineRecord = null; lastState = null;
   try {
-    await session.connect(code);
-  } catch {
+    const { OnlineSession } = await import('./net/online.ts');
     if (attempt !== joinAttempt) return;
-    // The dialog stays open so the code can be corrected or retried.
-    online = null;
+    const session = new OnlineSession({
+      onStatus: (text, tone) => { if (online === session) hud.setConnection(text, tone); },
+      onRoom: state => { if (online === session) onRoomState(state); },
+      onNotice: text => { if (online === session) hud.setNotice(text); },
+      onRecord: record => {
+        if (online !== session) return;
+        const animate = onlineRecord?.id === record.id;
+        onlineRecord = record;
+        saveOnline();
+        if (mode === 'online') game.loadRecord(record, animate);
+      },
+      onIdentity: next => {
+        if (online === session) {
+          identity = next;
+          if (onlineRecord?.id === next.gameId) saveOnline();
+        }
+      },
+      onUndo: request => {
+        if (online !== session) return;
+        if (!request) { library.dismissUndo(); return; }
+        if (seat === request.seat) hud.setNotice('已请求悔棋，等待对手确认');
+        else if (seat !== 'spectator') library.undo(accept => session.answerUndo(accept));
+      },
+      onSide: side => {
+        if (online !== session) return;
+        seat = side === RED ? 'red' : side === BLACK ? 'black' : 'spectator';
+        if (mode !== 'review') game.setMode('online', side);
+      },
+      onConnection: connected => { if (online === session) game.setConnection(connected, !(lastState?.waiting ?? true)); },
+      onClosed: () => { if (online === session) { goLocal(); hud.setNotice('棋局已保留，可从棋局记录续局'); } },
+    });
+    online = session;
+    await session.connect(code, resumeToken);
+    if (attempt !== joinAttempt || online !== session) { session.leave(); return; }
     connecting = false;
-    roomDialog.fail('连接失败');
-    return;
+    mode = 'online'; reviewEntry = null;
+    seat = session.side === RED ? 'red' : session.side === BLACK ? 'black' : 'spectator';
+    hud.setMode(mode); game.setMode(mode, session.side);
+    if (onlineRecord) game.loadRecord(onlineRecord);
+    const joinedState = lastState as RoomState | null;
+    roomDialog.showWaiting(session.roomId ?? '', joinedState?.waiting ?? true, seatText());
+    if (joinedState && !joinedState.waiting) scheduleClose();
+  } catch (error) {
+    if (attempt !== joinAttempt) return;
+    const failed = online; online = null; failed?.leave(); connecting = false;
+    roomDialog.fail(error instanceof Error && /凭据|座位|房间|存档/.test(error.message) ? error.message : '连接失败，请重试');
   }
-  if (attempt !== joinAttempt || online !== session) {
-    session.leave();
-    return;
-  }
-  connecting = false;
-
-  mode = 'online';
-  seat = session.side === RED ? 'red' : session.side === BLACK ? 'black' : 'spectator';
-  hud.setMode('online');
-  game.setMode('online', session.side);
-  roomDialog.showWaiting(session.roomId ?? '', lastState?.waiting ?? true, seatText());
 }
-
+function scheduleClose(): void {
+  if (closeTimer !== null) clearTimeout(closeTimer);
+  closeTimer = window.setTimeout(() => { closeTimer = null; roomDialog.hide(); }, 800);
+}
 function onRoomState(state: RoomState): void {
   const wasWaiting = lastState?.waiting ?? true;
   lastState = state;
   game.setConnection(online?.isConnected() ?? false, !state.waiting);
-  hud.setRoom(state.code);
-  hud.setRoomWaiting(state.waiting);
-  hud.setConnection(seatText(), 'ok');
-  if (!roomDialog.isOpen) return;
-  roomDialog.updateWaiting(state.waiting, waitingText(state));
-  // Filling the second seat is the moment to get out of the way.
-  if (wasWaiting && !state.waiting) {
-    if (closeTimer !== null) window.clearTimeout(closeTimer);
-    closeTimer = window.setTimeout(() => {
-      closeTimer = null;
-      roomDialog.hide();
-    }, 900);
+  hud.setRoom(state.code); hud.setRoomWaiting(state.waiting); hud.setConnection(seatText(), 'ok');
+  if (roomDialog.isOpen) {
+    roomDialog.updateWaiting(state.waiting, state.waiting ? '等待对手回到棋局' : '双方已就位');
+    if (wasWaiting && !state.waiting) scheduleClose();
   }
 }
-
-function seatText(): string {
-  if (seat === 'red') return '执红';
-  if (seat === 'black') return '执黑';
-  return '观战';
-}
-
-function waitingText(state: RoomState): string {
-  if (state.waiting) return seat === 'spectator' ? '等待两位棋手落座' : '等待对手加入';
-  return '对手已就位';
-}
-
-async function copyInvite(text: string): Promise<void> {
-  try {
-    await navigator.clipboard.writeText(text);
-    hud.setNotice('邀请已复制');
-  } catch {
-    hud.setNotice('复制失败', 'error');
-  }
-}
-
-// --- Mode switching ------------------------------------------------------
-
+function seatText(): string { return seat === 'red' ? '执红' : seat === 'black' ? '执黑' : '观战'; }
 function goLocal(): void {
-  ++joinAttempt;
-  connecting = false;
-  if (closeTimer !== null) {
-    window.clearTimeout(closeTimer);
-    closeTimer = null;
-  }
-  const previous = online;
-  online = null;
-  previous?.leave();
-  seat = null;
-  lastState = null;
-  mode = 'local';
-  roomDialog.hide();
-  hud.setMode('local');
-  hud.setConnection('本机双人', 'idle');
-  game.setMode('local', null);
-  game.restart();
+  ++joinAttempt; connecting = false;
+  if (closeTimer !== null) { clearTimeout(closeTimer); closeTimer = null; }
+  const previous = online; online = null; previous?.leave();
+  seat = null; lastState = null; identity = null; onlineRecord = null;
+  mode = 'local'; reviewEntry = null;
+  roomDialog.hide(); hud.setMode(mode); hud.setConnection('本机双人', 'idle');
+  game.setMode(mode, null); game.loadRecord(localRecord);
 }
-
-// --- Wiring --------------------------------------------------------------
-
-// The game reports its own view mode; keep the HUD honest about the toggle.
-game.onStatus = (next) => hud.update({ ...next, mode });
-
-game.onLocalMove = (uci) => {
-  if (mode === 'online' && online?.isConnected()) online.sendMove(uci);
-};
-
+function resume(entry: ArchiveEntry): void {
+  if (!archive.valid(entry)) { hud.setNotice('棋谱损坏，无法恢复', 'error'); return; }
+  if (entry.mode === 'online') {
+    if (online?.isConnected() && online.roomId === entry.roomCode && identity?.seat === entry.seat) { exitReview(); return; }
+    roomDialog.showConnecting(entry.roomCode ?? '');
+    void enterRoom(entry.roomCode ?? null, entry.resumeToken);
+  } else {
+    goLocal(); localRecord = entry.record; game.loadRecord(localRecord); save(entry);
+    hud.setNotice('已恢复对局');
+  }
+}
+function review(entry: ArchiveEntry): void {
+  if (!archive.valid(entry)) { hud.setNotice('棋谱损坏，无法复盘', 'error'); return; }
+  mode = 'review'; reviewEntry = entry; reviewPly = entry.record.moves.length;
+  hud.setMode(mode); game.setMode(mode, null); game.loadRecord(entry.record, false, reviewPly);
+}
+function stepReview(delta: number): void {
+  if (!reviewEntry) return;
+  reviewPly = Math.max(0, Math.min(reviewEntry.record.moves.length, reviewPly + delta));
+  game.loadRecord(reviewEntry.record, false, reviewPly);
+}
+function exitReview(): void {
+  reviewEntry = null;
+  if (online?.isConnected() && onlineRecord) {
+    mode = 'online'; hud.setMode(mode); game.setMode(mode, online.side); game.loadRecord(onlineRecord);
+  } else goLocal();
+}
+game.onStatus = snapshot => hud.update({ ...snapshot, mode });
+game.onRecord = record => { localRecord = record; save({ record, mode: 'local' }); };
+game.onLocalMove = uci => { if (mode === 'online' && online?.isConnected()) online.sendMove(uci); };
 game.onCue = (cue: GameCue) => sound.play(cue);
-
-hud.setMode('local');
-game.start();
-
-const invitationCode = new URLSearchParams(window.location.search).get('room')?.trim().toUpperCase();
+hud.setMode(mode); game.start(); game.setViewPreset(preset);
+const active = archive.activeLocal();
+if (active && archive.valid(active)) { localRecord = active.record; game.loadRecord(localRecord); }
+else save({ record: localRecord, mode: 'local' });
+const invitationCode = new URLSearchParams(location.search).get('room')?.trim().toUpperCase();
 if (invitationCode && /^[A-Z0-9]{4}$/.test(invitationCode)) roomDialog.showEntry('', invitationCode);
-
-window.addEventListener('beforeunload', () => {
-  online?.leave();
-  game.dispose();
-  hud.dispose();
-  sound.dispose();
-});
+window.addEventListener('beforeunload', () => { online?.leave(); game.dispose(); hud.dispose(); sound.dispose(); });

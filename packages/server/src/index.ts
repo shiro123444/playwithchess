@@ -18,7 +18,8 @@ const HOST = process.env.HOST ?? '0.0.0.0';
 
 const rooms = {
   // `code` is matched through the matchmaker's room listing, so joining with a
-  // shared code lands in that exact table (and creates it if it is gone).
+  // shared code finds the live table or rehydrates its durable file. Unknown
+  // codes are rejected by XiangqiRoom instead of creating an empty game.
   xiangqi: defineRoom(XiangqiRoom).filterBy(['code']),
 };
 
