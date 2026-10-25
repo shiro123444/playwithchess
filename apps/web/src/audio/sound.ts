@@ -10,6 +10,8 @@
  * gesture — is allowed to start.
  */
 
+import { voiceFor } from './reaction-voices.ts';
+
 export type SoundCue = 'move' | 'capture' | 'check' | 'end' | 'click';
 
 const STORAGE_KEY = 'xiangqi.sound';
@@ -146,6 +148,58 @@ export class SoundBoard {
     }
   }
 
+  /**
+   * Play the designed voice for a reaction sticker.
+   *
+   * Voices are mixed at roughly the level of a piece landing, not a UI click:
+   * a reaction is something the other player sent, so it should be audible
+   * across the room without competing with the move that follows it.
+   */
+  playReaction(id: string): void {
+    if (!this.enabled) return;
+    const context = this.ensureContext();
+    const out = this.master;
+    if (!context || !out) return;
+    if (context.state === 'suspended') void context.resume().catch(() => undefined);
+    const start = context.currentTime + 0.002;
+    const voice = voiceFor(id);
+    for (const note of voice.notes) {
+      const at = start + note.at;
+      const tone = context.createOscillator();
+      tone.type = note.type;
+      tone.frequency.setValueAtTime(note.freq, at);
+      if (note.glideTo !== undefined) {
+        tone.frequency.exponentialRampToValueAtTime(Math.max(20, note.glideTo), at + note.dur);
+      }
+      const gain = context.createGain();
+      // A few milliseconds of attack keeps the small speakers from clicking.
+      gain.gain.setValueAtTime(0.0001, at);
+      gain.gain.exponentialRampToValueAtTime(note.level, at + 0.012);
+      gain.gain.exponentialRampToValueAtTime(0.0001, at + note.dur);
+      tone.connect(gain).connect(out);
+      tone.start(at);
+      tone.stop(at + note.dur + 0.02);
+    }
+    if (voice.noise) {
+      const at = start + voice.noise.at;
+      const source = context.createBufferSource();
+      source.buffer = this.noise(context);
+      const band = context.createBiquadFilter();
+      band.type = 'bandpass';
+      band.Q.value = 0.9;
+      band.frequency.setValueAtTime(voice.noise.hz, at);
+      band.frequency.exponentialRampToValueAtTime(Math.max(40, voice.noise.hzTo), at + voice.noise.dur);
+      const gain = context.createGain();
+      gain.gain.setValueAtTime(voice.noise.level, at);
+      gain.gain.exponentialRampToValueAtTime(0.0001, at + voice.noise.dur);
+      source.connect(band).connect(gain).connect(out);
+      this.activeSamples.add(source);
+      source.onended = () => { this.activeSamples.delete(source); source.disconnect(); gain.disconnect(); };
+      source.start(at);
+      source.stop(at + voice.noise.dur + 0.02);
+    }
+  }
+
   dispose(): void {
     void this.context?.close().catch(() => undefined);
     this.context = null;
@@ -181,10 +235,11 @@ export class SoundBoard {
 
   private noise(context: AudioContext): AudioBuffer {
     if (this.noiseBuffer) return this.noiseBuffer;
-    // One buffer serves every cue. 250 ms covers the longest noise decay
-    // (the capture's 160 ms) with room to spare; a source that outlives its
-    // buffer just goes silent, so being generous costs nothing at runtime.
-    const length = Math.floor(context.sampleRate * 0.25);
+    // One buffer serves every cue. 600 ms covers the longest noise decay —
+    // the reaction sweeps run to 400 ms — with room to spare; a source that
+    // outlives its buffer just goes silent, so being generous costs nothing
+    // at runtime.
+    const length = Math.floor(context.sampleRate * 0.6);
     const buffer = context.createBuffer(1, length, context.sampleRate);
     const data = buffer.getChannelData(0);
     for (let i = 0; i < length; i++) data[i] = Math.random() * 2 - 1;

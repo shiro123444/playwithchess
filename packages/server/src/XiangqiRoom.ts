@@ -1,12 +1,17 @@
 import { CloseCode, Room, ServerError, type Client } from '@colyseus/core';
-import { BLACK, RED, appendRecord, createRecord, replayRecord, type Color, type GameRecord, type Position } from '@xiangqi/rules';
+import { BLACK, RED, appendRecord, createRecord, isReactionId, replayRecord, type Color, type GameRecord, type Position } from '@xiangqi/rules';
 import { MatchStore, newSeatToken, tokenHash, type PlayerSeat, type StoredMatch } from './storage/matches.ts';
 
 export type Seat = PlayerSeat | 'spectator';
+/** What a joiner asked for; `random` means "whichever seat is free". */
+export type PreferredSeat = PlayerSeat | 'random';
 export interface RoomOptions { code?: string; variantId?: string; initialClockMs?: number; incrementMs?: number }
-interface JoinOptions { displayName?: unknown; resumeToken?: unknown }
+interface JoinOptions { displayName?: unknown; resumeToken?: unknown; preferredSeat?: unknown }
 interface Player { seat: Seat; name: string; token: string | null; connected: boolean }
 interface UndoRequest { seat: PlayerSeat; ply: number; count: number }
+
+/** Reactions are decorative, so a cheap per-client cooldown is enough. */
+const REACTION_COOLDOWN_MS = 400;
 const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const randomCode = () => Array.from({ length: 4 }, () => alphabet[Math.floor(Math.random() * alphabet.length)]).join('');
 
@@ -21,6 +26,7 @@ export class XiangqiRoom extends Room {
   private rematchVotes = new Set<Seat>();
   private clockStartedAt = 0;
   private clockTimer: ReturnType<typeof setInterval> | null = null;
+  private lastReactionAt = new Map<string, number>();
 
   override onCreate(options: RoomOptions = {}): void {
     if (options.code) {
@@ -51,6 +57,23 @@ export class XiangqiRoom extends Room {
         from: this.players.get(client.sessionId)?.name ?? '棋友', body: message.body.trim().slice(0, 160),
       });
     });
+    // Reactions are ephemeral by design: nothing is stored, so a sticker can
+    // neither affect the record nor be replayed after a reconnect. The server
+    // validates the id because the client renders whatever it is told to.
+    this.onMessage('reaction', (sender, message) => {
+      const player = this.players.get(sender.sessionId);
+      const id = message?.id;
+      if (!player || !isReactionId(id)) return;
+      const now = Date.now();
+      if (now - (this.lastReactionAt.get(sender.sessionId) ?? 0) < REACTION_COOLDOWN_MS) return;
+      this.lastReactionAt.set(sender.sessionId, now);
+      // The sender already drew this sticker the moment it pressed, so it is
+      // echoed to everyone else only — echoing back would double-draw it.
+      const payload = { id, seat: player.seat, name: player.name };
+      for (const client of this.clients) {
+        if (client.sessionId !== sender.sessionId) client.send('reaction', payload);
+      }
+    });
   }
 
   override onJoin(client: Client, options: JoinOptions = {}): void {
@@ -67,13 +90,9 @@ export class XiangqiRoom extends Room {
         throw new ServerError(409, '该座位已在另一页面，请先关闭原对局');
       }
     } else {
-      seat = !this.saved.reservations.red ? 'red' : !this.saved.reservations.black ? 'black' : 'spectator';
-      if (seat !== 'spectator') {
-        token = newSeatToken();
-        const next = structuredClone(this.saved);
-        next.reservations[seat] = { name, tokenHash: tokenHash(token) };
-        this.commit(next);
-      }
+      const claimed = this.claimSeat(options.preferredSeat, name);
+      seat = claimed.seat;
+      token = claimed.token;
     }
     this.players.set(client.sessionId, { seat, name: seat === 'spectator' ? name : this.saved.reservations[seat]!.name,
       token, connected: true });
@@ -85,6 +104,7 @@ export class XiangqiRoom extends Room {
 
   override onLeave(client: Client, code?: number): void {
     const player = this.players.get(client.sessionId);
+    this.lastReactionAt.delete(client.sessionId);
     if (!player) return;
     player.connected = false;
     if (player.seat !== 'spectator') {
@@ -119,6 +139,33 @@ export class XiangqiRoom extends Room {
   }
   private ready(): boolean {
     return (['red', 'black'] as const).every(side => [...this.players.values()].some(p => p.seat === side && p.connected));
+  }
+
+  /**
+   * Give a joiner the seat they asked for, or the first free one.
+   *
+   * A preference that is already taken is never a hard failure. Somebody who
+   * followed an invitation and asked for black should still get into the game
+   * when black is gone — they lose the seat, not the table — so a requested
+   * side is honoured when free, otherwise the remaining seat, otherwise the
+   * spectator bench. `random` means exactly that: take the first free seat.
+   */
+  private claimSeat(preferred: unknown, name: string): { seat: Seat; token: string | null } {
+    const free: PlayerSeat[] = (['red', 'black'] as const).filter(side => !this.saved.reservations[side]);
+    const wanted: PreferredSeat | 'other' = preferred === 'red' || preferred === 'black' || preferred === 'random'
+      ? preferred : 'random';
+    const order: readonly PlayerSeat[] = wanted === 'random'
+      ? ['red', 'black']
+      : [wanted, wanted === 'red' ? 'black' : 'red'];
+    const seat = order.find(side => free.includes(side));
+    if (!seat) return { seat: 'spectator', token: null };
+    // Persist before anyone can see the seat: a reserved seat whose token was
+    // never written would let the next joiner take it out from under us.
+    const token = newSeatToken();
+    const next = structuredClone(this.saved);
+    next.reservations[seat] = { name, tokenHash: tokenHash(token) };
+    this.commit(next);
+    return { seat, token };
   }
   private snapshot() {
     const record = this.saved.record;

@@ -5,19 +5,55 @@
  * code) and a waiting view that shows the code and a painted bloom until the
  * second seat fills. The bloom is the point — "waiting" should look like
  * something growing, not like a spinner.
+ *
+ * The entry form also asks which side the player wants. The wish is sent with
+ * the join and honoured only while that seat is free, so somebody who asked
+ * for black an invitation too late still lands in the game instead of being
+ * bounced — the waiting view then says which side they actually got.
  */
 
+import type { PreferredSeat } from '../net/online.ts';
+
 export interface RoomDialogHandlers {
-  /** Create a fresh room. `code` is what the user typed, if anything. */
-  onEnter: (code: string | null) => void;
+  /** Create or join. `code` is what the user typed, `null` creates a table. */
+  onEnter: (code: string | null, preferredSeat: PreferredSeat) => void;
   /** Leave the current room and close. */
   onLeave: () => void;
   onCancel: () => void;
   onCopy: (text: string) => void;
 }
 
+/** What the waiting view knows about the table right now. */
+export interface SeatStatus {
+  red: string | null;
+  black: string | null;
+  yourSeat: 'red' | 'black' | 'spectator';
+  spectators: number;
+}
+
 const CODE_LENGTH = 4;
 const CODE_PATTERN = /^[A-Z0-9]{4}$/;
+const SEAT_KEY = 'xiangqi.seat';
+
+const SEAT_CHOICES: ReadonlyArray<{ id: PreferredSeat; label: string; hint: string }> = [
+  { id: 'random', label: '随机', hint: '哪个空位就坐哪边' },
+  { id: 'red', label: '执红', hint: '先手' },
+  { id: 'black', label: '执黑', hint: '后手' },
+];
+
+function readSeatPreference(): PreferredSeat {
+  try {
+    const stored = window.localStorage.getItem(SEAT_KEY);
+    if (stored === 'red' || stored === 'black' || stored === 'random') return stored;
+  } catch {
+    // Storage can be blocked; the default still works.
+  }
+  return 'random';
+}
+
+function writeSeatPreference(seat: PreferredSeat): void {
+  try { window.localStorage.setItem(SEAT_KEY, seat); } catch { /* non-fatal */ }
+}
 
 function el<K extends keyof HTMLElementTagNameMap>(
   tag: K,
@@ -72,10 +108,16 @@ export class RoomDialog {
   private readonly copyButton: HTMLButtonElement;
   private readonly leaveButton: HTMLButtonElement;
   private readonly closeButton: HTMLButtonElement;
+  private readonly seatButtons: Map<PreferredSeat, HTMLButtonElement>;
+  private readonly seatCards: Map<'red' | 'black', { card: HTMLElement; name: HTMLElement; tag: HTMLElement }>;
+  private readonly seatSummary: HTMLElement;
+  private seat: PreferredSeat = 'random';
   private open = false;
   private busy = false;
   private lastFocus: HTMLElement | null = null;
   private code = '';
+  /** Remembers the local player's seat so the roster can mark it. */
+  private yourSeat: SeatStatus['yourSeat'] = 'spectator';
 
   constructor(container: HTMLElement, private readonly handlers: RoomDialogHandlers) {
     this.backdrop = el('div', 'room-backdrop');
@@ -119,6 +161,26 @@ export class RoomDialog {
     const field = el('div', 'room-field');
     field.append(this.input);
 
+    // --- Side picker ----------------------------------------------------
+    // Same segmented idiom as the mode switch, so the two choices read as
+    // one family of controls rather than a form bolted onto the card.
+    const seatGroup = el('div', 'seat-picker');
+    seatGroup.setAttribute('role', 'group');
+    seatGroup.setAttribute('aria-label', '执子');
+    this.seatButtons = new Map();
+    for (const choice of SEAT_CHOICES) {
+      const button = el('button', 'seat-choice');
+      button.type = 'button';
+      button.dataset.seat = choice.id;
+      button.title = choice.hint;
+      button.append(el('span', 'seat-choice-dot'), el('span', 'seat-choice-label', choice.label));
+      button.addEventListener('click', () => this.chooseSeat(choice.id));
+      seatGroup.append(button);
+      this.seatButtons.set(choice.id, button);
+    }
+    const seatLabel = el('p', 'room-hint room-hint-seat', '空位先到先得，另一边会为你留位');
+    this.chooseSeat(readSeatPreference());
+
     const actions = el('div', 'room-actions');
     this.entryEnterButton = el('button', 'primary-button', '进入');
     this.entryEnterButton.type = 'button';
@@ -132,7 +194,7 @@ export class RoomDialog {
     this.entryStatus = el('p', 'room-status');
     this.entryStatus.setAttribute('role', 'status');
 
-    this.entry.append(title, field, actions, this.entryStatus);
+    this.entry.append(title, field, seatGroup, seatLabel, actions, this.entryStatus);
 
     // --- Waiting view ---------------------------------------------------
     this.waiting = el('div', 'room-waiting');
@@ -159,7 +221,25 @@ export class RoomDialog {
     });
     waitingRow.append(this.copyButton, this.leaveButton);
 
-    this.waiting.append(createBloom(), waitingTitle, this.codeText, codeLabel, waitingRow, this.waitingStatus);
+    // --- Seat roster ----------------------------------------------------
+    // Two seats side by side, each showing who holds it. This is the part the
+    // waiting view was missing: before, the only way to learn which side you
+    // were given was to start playing.
+    const roster = el('div', 'seat-roster');
+    this.seatCards = new Map();
+    for (const side of ['red', 'black'] as const) {
+      const card = el('div', 'seat-card');
+      card.dataset.side = side;
+      const dot = el('span', 'seat-card-dot');
+      const name = el('span', 'seat-card-name', '空位');
+      const tag = el('span', 'seat-card-tag');
+      card.append(dot, name, tag);
+      roster.append(card);
+      this.seatCards.set(side, { card, name, tag });
+    }
+    this.seatSummary = el('p', 'room-hint seat-summary');
+
+    this.waiting.append(createBloom(), waitingTitle, this.codeText, codeLabel, roster, this.seatSummary, waitingRow, this.waitingStatus);
 
     this.card.append(this.closeButton, this.entry, this.waiting);
     this.backdrop.append(this.card);
@@ -211,19 +291,47 @@ export class RoomDialog {
   }
 
   /** Open on the waiting view for `code`. */
-  showWaiting(code: string, waiting: boolean, status = ''): void {
+  showWaiting(code: string, waiting: boolean, status = '', seats?: SeatStatus): void {
     this.code = code;
     this.busy = false;
     this.showView('waiting');
     this.codeText.textContent = code || '—';
+    // Never carry the previous table's roster into a new one.
+    this.setSeats(seats ?? { red: null, black: null, yourSeat: 'spectator', spectators: 0 });
     this.setWaitingStatus(status || (waiting ? '等待对手加入' : '对手已就位'), waiting);
     this.openDialog();
   }
 
   /** Update the live state of an already-open waiting view. */
-  updateWaiting(waiting: boolean, status: string): void {
+  updateWaiting(waiting: boolean, status: string, seats?: SeatStatus): void {
     if (!this.open) return;
     this.setWaitingStatus(status, waiting);
+    if (seats) this.setSeats(seats);
+  }
+
+  /**
+   * Reflect who holds each seat, and which one is yours.
+   *
+   * The roster is the answer to "did I get the colour I asked for?" — a
+   * requested side is only a wish, so the dialog has to show the outcome
+   * rather than repeat the wish back.
+   */
+  setSeats(seats: SeatStatus): void {
+    this.yourSeat = seats.yourSeat;
+    for (const side of ['red', 'black'] as const) {
+      const card = this.seatCards.get(side);
+      if (!card) continue;
+      const name = seats[side];
+      card.name.textContent = name ?? '空位';
+      const mine = seats.yourSeat === side;
+      card.card.classList.toggle('is-empty', !name);
+      card.card.classList.toggle('is-you', mine);
+      card.tag.textContent = mine ? '你' : name ? '已就座' : '等待';
+    }
+    this.waiting.dataset.you = seats.yourSeat;
+    const spectators = seats.spectators > 0 ? ` · ${seats.spectators} 人观战` : '';
+    this.seatSummary.textContent = seats.yourSeat === 'spectator'
+      ? `观战中${spectators}` : `你执${seats.yourSeat === 'red' ? '红' : '黑'}${spectators}`;
   }
 
   /** Show a failure on the entry view without closing the dialog. */
@@ -287,9 +395,18 @@ export class RoomDialog {
   private enter(code: string | null): void {
     if (this.busy) return;
     this.busy = true;
+    writeSeatPreference(this.seat);
     this.refreshEntry();
     this.setEntryStatus(code ? '正在进入…' : '正在创建…', 'idle');
-    this.handlers.onEnter(code);
+    this.handlers.onEnter(code, this.seat);
+  }
+
+  private chooseSeat(seat: PreferredSeat): void {
+    this.seat = seat;
+    for (const [id, button] of this.seatButtons) {
+      button.classList.toggle('is-active', id === seat);
+      button.setAttribute('aria-pressed', String(id === seat));
+    }
   }
 
   private refreshEntry(): void {

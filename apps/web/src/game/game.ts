@@ -47,6 +47,7 @@ import {
 import type { PhysicsWorld } from '../engine/physics.ts';
 import { cuesFor } from '../audio/cue.ts';
 import { SCENE_FOV, createSceneRig } from '../engine/scene.ts';
+import { ReactionLayer } from '../engine/reactions.ts';
 
 const ANIMATION_MS = 320;
 const CAMERA_LERP = 0.07;
@@ -94,6 +95,8 @@ export interface GameController {
   onCue: ((cue: GameCue) => void) | null;
   /** Swing the camera to the other end of the board. */
   flipCamera(): void;
+  /** Pop a reaction sticker over `side`'s back ranks. Returns false for unknown ids. */
+  showReaction(id: string, side: Color | null): boolean;
 }
 
 interface Options {
@@ -139,7 +142,7 @@ export function createGame({ canvas, variantId = XIANGQI.id }: Options): GameCon
   const landingRing = createLastMoveMarker(0x3f7aa8);
   landingRing.visible = false;
   scene.add(landingRing);
-  let landingAt = 0;
+  const reactions = new ReactionLayer(scene, camera);  let landingAt = 0;
   let selectionVisual: PieceVisual | null = null;
   const raycaster = new THREE.Raycaster();
   const pointer = new THREE.Vector2();
@@ -210,6 +213,9 @@ export function createGame({ canvas, variantId = XIANGQI.id }: Options): GameCon
       const world = worldFor(square);
       visual.mesh.position.copy(world);
       visual.home.copy(world);
+      // Pieces that appear after a flip (a restored board, a reloaded record)
+      // must start already facing the viewer.
+      visual.cap.rotation.y = viewSide === RED ? 0 : Math.PI;
       visual.mesh.userData.square = square;
       visual.mesh.userData.type = type;
       visual.mesh.userData.red = red;
@@ -616,6 +622,21 @@ export function createGame({ canvas, variantId = XIANGQI.id }: Options): GameCon
     ).normalize();
     const distance = fitDistance(direction) * zoom;
     cameraTarget.copy(direction).multiplyScalar(distance);
+    orientGlyphs();
+  }
+
+  /**
+   * Turn every piece's inked face toward the viewer.
+   *
+   * The glyph is painted once, readable from red's side (+z). Sitting at the
+   * far end of the board does not mirror the board — it turns the camera
+   * around — so without this every character reads upside down to whichever
+   * side is not red. The body is a plain cylinder, so spinning only the cap
+   * keeps the piece physically identical while the text stays upright.
+   */
+  function orientGlyphs(): void {
+    const angle = viewSide === RED ? 0 : Math.PI;
+    for (const visual of pieces.values()) visual.cap.rotation.y = angle;
   }
 
   function updateCameraForTurn(): void {
@@ -685,6 +706,7 @@ export function createGame({ canvas, variantId = XIANGQI.id }: Options): GameCon
 
     updateTweens(now);
     physics?.step(delta);
+    reactions.update(now);
 
     camera.position.lerp(cameraTarget, CAMERA_LERP);
     camera.lookAt(0, 0, 0);
@@ -818,6 +840,7 @@ export function createGame({ canvas, variantId = XIANGQI.id }: Options): GameCon
     window.removeEventListener('resize', onResize);
     window.removeEventListener('orientationchange', onResize);
     canvasResizeObserver.disconnect();
+    reactions.dispose();
     physics?.dispose();
     rig.dispose();
   }
@@ -885,6 +908,9 @@ export function createGame({ canvas, variantId = XIANGQI.id }: Options): GameCon
       // Cut rather than sweep: easing 180° means clicking a piece mid-flight
       // picks a square from the old camera, and the board reads as spinning.
       camera.position.copy(cameraTarget);
+    },
+    showReaction(id, side) {
+      return reactions.show(id, side);
     },
   };
 }

@@ -1,0 +1,18 @@
+3D reaction art: Microsoft Fluent Emoji (https://github.com/microsoft/fluentui-emoji)
+License: MIT, Copyright (c) Microsoft Corporation. Full text in LICENSE-FluentEmoji.txt.
+
+Files are the "3D" renders, copied unchanged from:
+  assets/<Emoji Name>/3D/<emoji_name>_3d.png
+
+  joy.png       Face with tears of joy
+  love.png      Smiling face with heart-eyes
+  thinking.png  Thinking face
+  eyeroll.png   Face with rolling eyes
+  party.png     Partying face
+  fire.png      Fire
+  mindblown.png Exploding head
+  cry.png       Loudly crying face
+  nerd.png      Nerd face
+  handshake.png Handshake
+  hundred.png   Hundred points
+  crown.png     Crown

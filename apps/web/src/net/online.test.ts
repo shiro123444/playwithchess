@@ -26,7 +26,7 @@ function fixture() {
   };
   const handlers: OnlineHandlers = {
     onStatus: vi.fn(), onRoom: vi.fn(), onNotice: vi.fn(), onRecord: vi.fn(),
-    onSide: vi.fn(), onClosed: vi.fn(), onConnection: vi.fn(),
+    onSide: vi.fn(), onClosed: vi.fn(), onConnection: vi.fn(), onReaction: vi.fn(),
   };
   sdk.create.mockResolvedValue(room);
   sdk.joinById.mockResolvedValue(room);
@@ -46,6 +46,15 @@ describe('online room lifecycle', () => {
     expect(session.isConnected()).toBe(true);
   });
 
+  it('asks for the requested side, defaulting to whichever seat is free', async () => {
+    const { session } = fixture();
+    await session.connect(null, undefined, 'black');
+    expect(sdk.create).toHaveBeenCalledWith('xiangqi', expect.objectContaining({ preferredSeat: 'black' }));
+    const { session: other } = fixture();
+    await other.connect('ABCD');
+    expect(sdk.joinById).toHaveBeenCalledWith('ABCD', expect.objectContaining({ preferredSeat: 'random' }));
+  });
+
   it('joins the requested room without creating one on a failed invitation', async () => {
     const { session } = fixture();
     sdk.joinById.mockRejectedValue(new Error('not found'));
@@ -63,7 +72,7 @@ describe('online room lifecycle', () => {
     expect(session.side).toBe(BLACK);
     expect(handlers.onSide).toHaveBeenCalledWith(BLACK);
     expect(handlers.onRoom).toHaveBeenLastCalledWith({
-      code: 'ABCD', seats: { red: 'A', black: 'B' }, spectators: 1, waiting: false,
+      code: 'ABCD', seats: { red: 'A', black: 'B' }, spectators: 1, waiting: false, yourSeat: 'black',
     });
   });
 
@@ -123,6 +132,32 @@ describe('online room lifecycle', () => {
     messages.get('snapshot')!({ record: createRecord('test'), ready: true });
     expect(handlers.onRoom).toHaveBeenLastCalledWith(expect.objectContaining({ waiting: false }));
     expect(handlers.onRecord).toHaveBeenCalled();
+  });
+
+  it('forwards a relayed sticker and normalizes an unexpected seat to spectator', async () => {
+    const { session, messages, handlers } = fixture();
+    await session.connect('ABCD');
+    messages.get('reaction')!({ id: 'joy', seat: 'red', name: '红方' });
+    expect(handlers.onReaction).toHaveBeenLastCalledWith({ id: 'joy', seat: 'red', name: '红方' });
+    messages.get('reaction')!({ id: 'cry', seat: 'host', name: 'A' });
+    expect(handlers.onReaction).toHaveBeenLastCalledWith({ id: 'cry', seat: 'spectator', name: 'A' });
+  });
+
+  it('ignores relayed stickers with no usable id', async () => {
+    const { session, messages, handlers } = fixture();
+    await session.connect('ABCD');
+    messages.get('reaction')!({ seat: 'red', name: '红方' });
+    messages.get('reaction')!({ id: 42, seat: 'red' });
+    expect(handlers.onReaction).not.toHaveBeenCalled();
+  });
+
+  it('sends a sticker through the room, including to a closed room without throwing', async () => {
+    const { session, room } = fixture();
+    await session.connect('ABCD');
+    session.sendReaction('party');
+    expect(room.send).toHaveBeenLastCalledWith('reaction', { id: 'party' });
+    session.leave();
+    expect(() => session.sendReaction('party')).not.toThrow();
   });
 
 });

@@ -1,5 +1,6 @@
 import type { GameStatusSnapshot } from '../game/game.ts';
 import { RED, type Color } from '@xiangqi/rules';
+import { createBrandMark } from './brand.ts';
 
 /**
  * The HUD is plain DOM layered over the canvas. Keeping it out of WebGL means
@@ -55,6 +56,8 @@ export class Hud {
   private readonly nextButton: HTMLButtonElement;
   private readonly activity: HTMLElement;
   private readonly turnBanner: HTMLElement;
+  /** Host element the reaction tray mounts into, positioned in the top bar. */
+  readonly reactionSlot: HTMLElement;
   private previousTurn = '';
   private noticeTimer: number | null = null;
 
@@ -64,8 +67,13 @@ export class Hud {
 
     // --- Top bar: title, mode switch, room, sound, camera ---------------
     const top = el('header', 'hud-top');
+    // The mark replaces the old 弈 wordmark. It is the identity; the character
+    // stays beside it as a small caption so the name is still spelled out, but
+    // at a size that cannot compete with the drawing.
     const brand = el('div', 'brand');
-    brand.append(el('h1', 'brand-title', '弈'));
+    const title = el('h1', 'brand-title');
+    title.append(createBrandMark('header'), el('span', 'brand-word', '弈'));
+    brand.append(title);
 
     const controls = el('div', 'hud-controls');
 
@@ -96,6 +104,11 @@ export class Hud {
     this.roomChip.append(dot, this.roomCodeText);
     this.roomChip.addEventListener('click', () => this.handlers.onOpenRoom());
 
+    // The reaction tray owns its own popover; the HUD only supplies the slot
+    // in the top bar so the two stay aligned across breakpoints.
+    const reactionSlot = el('div', 'reaction-slot');
+    this.reactionSlot = reactionSlot;
+
     // Sound is a state, not an action, so it is a toggle button rather than a
     // ghost button: `aria-pressed` carries the on/off for both sighted and
     // screen-reader users.
@@ -115,7 +128,7 @@ export class Hud {
     const history = el('button', 'ghost-button', '棋局');
     history.type = 'button';
     history.addEventListener('click', () => this.handlers.onHistory());
-    controls.append(modeSwitch, this.roomChip, sound, history, flip);
+    controls.append(modeSwitch, this.roomChip, reactionSlot, sound, history, flip);
     top.append(brand, controls);
     this.root.append(top);
 

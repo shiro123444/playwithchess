@@ -27,12 +27,13 @@ async function start() {
 }
 async function stop() { if (!server || server.exitCode !== null) return; const exited = new Promise(done => server.once('exit', done)); server.kill('SIGTERM'); await exited; }
 function watch(room) {
-  const state = { room, identity: null, snapshot: null, seats: null, pending: null, rejects: [] };
+  const state = { room, identity: null, snapshot: null, seats: null, pending: null, rejects: [], reactions: [] };
   for (const type of ['snapshot', 'move', 'reset']) room.onMessage(type, message => { state.snapshot = message; });
   room.onMessage('identity', message => { state.identity = message; });
   room.onMessage('seats', message => { state.seats = message; });
   room.onMessage('undo-pending', message => { state.pending = message; });
   room.onMessage('undo-cleared', () => { state.pending = null; });
+  room.onMessage('reaction', message => { state.reactions.push(message); });
   room.onMessage('reject', message => state.rejects.push(message));
   room.onMessage('event', () => {}); room.onMessage('chat', () => {});
   clients.add(room); room.onLeave(() => clients.delete(room)); room.send('sync'); return state;
@@ -61,6 +62,15 @@ try {
   assert.equal(b.pending.count, 2);
   b.room.send('undo-answer', { accept: true });
   await until(() => a.snapshot.record.moves.length === 0 && b.snapshot.record.moves.length === 0, 'accepted undo'); pass('accepted undo restores both clients');
+  a.room.send('reaction', { id: 'handshake' });
+  await until(() => b.reactions.length && spectator.reactions.length, 'relayed reaction');
+  assert.deepEqual(b.reactions.at(-1), { id: 'handshake', seat: 'red', name: 'Red' });
+  assert.equal(spectator.reactions.at(-1)?.seat, 'red');
+  // The sender drew its own sticker locally, so no echo comes back to it.
+  assert.equal(a.reactions.length, 0);
+  a.room.send('reaction', { id: 'not-a-real-sticker' });
+  await new Promise(done => setTimeout(done, 300));
+  assert.equal(b.reactions.length, 1); pass('reaction reaches opponent and spectator only, unknown ids dropped');
   a.room.send('move', { uci: 'h2e2' }); await until(() => b.snapshot.record.moves.length === 1, 'move after undo');
   b.room.send('move', { uci: 'h9g7' }); await until(() => a.snapshot.record.moves.length === 2, 'reply after undo');
   const fen = a.snapshot.fen;

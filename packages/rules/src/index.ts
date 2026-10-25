@@ -14,3 +14,4 @@ export * from './ai/evaluate.ts';
 export * from './ai/search.ts';
 export * from './notation.ts';
 export * from './record.ts';
+export * from './reactions.ts';

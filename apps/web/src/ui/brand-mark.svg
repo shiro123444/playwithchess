@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="弈">
+  <title>弈 · 三维中国象棋</title>
+  <defs>
+    <radialGradient id="bm-glaze" cx="34%" cy="26%" r="80%">
+      <stop offset="0" stop-color="#fffef9"/>
+      <stop offset="0.52" stop-color="#f3f9fc"/>
+      <stop offset="1" stop-color="#c6dceb"/>
+    </radialGradient>
+    <radialGradient id="bm-red" cx="34%" cy="26%" r="80%">
+      <stop offset="0" stop-color="#cf5f51"/>
+      <stop offset="0.64" stop-color="#b4463c"/>
+      <stop offset="1" stop-color="#93322b"/>
+    </radialGradient>
+    <linearGradient id="bm-ink" gradientUnits="userSpaceOnUse" x1="9" y1="55" x2="33" y2="31">
+      <stop offset="0" stop-color="#274e74"/>
+      <stop offset="0.62" stop-color="#3f7aa8"/>
+      <stop offset="1" stop-color="#9ab7cb"/>
+    </linearGradient>
+    <!-- The lattice fades toward every edge, so the board has no border. -->
+    <radialGradient id="bm-grid-fade" cx="46%" cy="56%" r="62%">
+      <stop offset="0.25" stop-color="#2f5f86" stop-opacity="0.46"/>
+      <stop offset="1" stop-color="#2f5f86" stop-opacity="0"/>
+    </radialGradient>
+    <mask id="bm-grid-mask">
+      <rect width="64" height="64" fill="url(#bm-grid-fade)"/>
+    </mask>
+    <filter id="bm-soft" x="-50%" y="-50%" width="200%" height="200%">
+      <feDropShadow dx="0" dy="1.6" stdDeviation="1.9" flood-color="#244a68" flood-opacity="0.26"/>
+    </filter>
+  </defs>
+
+  <!--
+    A fragment of the board: five lines each way on a 10-unit pitch, fading out
+    toward every edge so the grid dissolves into paper rather than ending on a
+    border. Both pieces sit on real intersections — that alignment is what makes
+    the mark read as a board rather than as two discs on a mesh.
+  -->
+  <g mask="url(#bm-grid-mask)" stroke="#2f5f86" stroke-width="1.4" stroke-linecap="round">
+    <path d="M2 12 H62"/><path d="M2 22 H62"/><path d="M2 32 H62"/>
+    <path d="M2 42 H62"/><path d="M2 52 H62"/>
+    <path d="M12 2 V62"/><path d="M22 2 V62"/><path d="M32 2 V62"/>
+    <path d="M42 2 V62"/><path d="M52 2 V62"/>
+  </g>
+
+  <!-- The move: one fine stroke from the square the red piece left. -->
+  <path d="M39 20 C35 27 29 34 25 40" fill="none" stroke="url(#bm-ink)"
+        stroke-opacity="0.65" stroke-width="2.1" stroke-linecap="round"/>
+
+  <!-- The red piece that just moved away, set back and smaller. -->
+  <g filter="url(#bm-soft)">
+    <circle cx="42" cy="12" r="8.2" fill="url(#bm-red)"/>
+    <circle cx="42" cy="12" r="8.2" fill="none" stroke="#8e3129" stroke-opacity="0.45" stroke-width="1.1"/>
+  </g>
+
+  <!-- The porcelain piece it landed on. -->
+  <g filter="url(#bm-soft)">
+    <circle cx="22" cy="42" r="13.2" fill="url(#bm-glaze)"/>
+    <circle cx="22" cy="42" r="13.2" fill="none" stroke="url(#bm-ink)" stroke-width="2"/>
+    <path d="M12.5 47.5 A9.6 9.6 0 0 0 29.5 50" fill="none"
+          stroke="#2f5f86" stroke-opacity="0.24" stroke-width="1.2" stroke-linecap="round"/>
+  </g>
+</svg>

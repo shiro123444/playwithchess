@@ -116,6 +116,8 @@ function glyphTextureFor(type: number, red: boolean): THREE.CanvasTexture {
 
 export interface PieceVisual {
   mesh: THREE.Group;
+  /** The inked face, kept so the glyph can be turned toward the viewer. */
+  cap: THREE.Mesh;
   /** Position when the visual was created, used by the capture animation. */
   home: THREE.Vector3;
 }
@@ -149,7 +151,7 @@ export function createPieceVisual(type: number, red: boolean): PieceVisual {
   cap.receiveShadow = true;
   group.add(cap);
 
-  return { mesh: group, home: new THREE.Vector3() };
+  return { mesh: group, cap, home: new THREE.Vector3() };
 }
 
 /** Thin ring shown under the selected piece. */

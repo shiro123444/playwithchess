@@ -152,6 +152,9 @@ body {
 }
 
 .brand-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
   margin: 0;
   font-family: var(--font-brand);
   font-weight: 400;
@@ -161,6 +164,27 @@ body {
   letter-spacing: 0.04em;
   /* Ink bleeding into paper. */
   text-shadow: 0 0 18px rgba(126, 166, 196, 0.55);
+}
+
+/*
+ * The mark carries the identity; the word is set smaller beside it so the
+ * header reads as a logotype rather than a title with a bullet. At tab width
+ * the word drops and the mark alone stands in.
+ */
+.brand-mark {
+  width: 1.12em;
+  height: 1.12em;
+  flex-shrink: 0;
+  display: block;
+  overflow: visible;
+}
+
+/* The name is a caption beside the mark, not a second logo. */
+.brand-word {
+  font-size: 0.54em;
+  letter-spacing: 0.2em;
+  color: var(--ink-soft);
+  text-shadow: none;
 }
 
 .hud-controls {
@@ -278,6 +302,123 @@ body {
 
 .sound-toggle.is-off .sound-icon {
   color: var(--ink-faint);
+}
+
+/* --- Reaction tray ------------------------------------------------------ */
+
+.reaction-slot {
+  position: relative;
+  display: inline-flex;
+}
+
+.reaction-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding-left: 8px;
+}
+
+.reaction-icon {
+  width: 22px;
+  height: 22px;
+  display: block;
+  filter: drop-shadow(0 2px 3px rgba(36, 56, 74, 0.22));
+  transition: transform var(--duration) var(--ease);
+}
+
+.reaction-toggle:hover .reaction-icon {
+  transform: translateY(-1px) scale(1.08);
+}
+
+.reaction-panel {
+  position: absolute;
+  top: calc(100% + 10px);
+  right: 0;
+  z-index: 6;
+  padding: 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 16px;
+  background: rgba(248, 251, 252, 0.94);
+  backdrop-filter: blur(16px);
+  box-shadow: var(--shadow-float);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translateY(-6px) scale(0.97);
+  transform-origin: top right;
+  transition: opacity 160ms var(--ease), transform 200ms var(--ease), visibility 0s linear 200ms;
+}
+
+.reaction-panel.is-open {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transform: none;
+  transition: opacity 160ms var(--ease), transform 200ms var(--ease), visibility 0s;
+}
+
+.reaction-panel:focus {
+  outline: none;
+}
+
+.reaction-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 54px);
+  gap: 6px;
+}
+
+/*
+ * Each sticker is a painted 3D render, so the lift on hover is what makes it
+ * read as an object sitting on the tray rather than an icon in a list. The
+ * cascade is driven by --i, which the tray sets when it opens.
+ */
+.reaction-sticker {
+  display: grid;
+  place-items: center;
+  width: 54px;
+  height: 54px;
+  padding: 4px;
+  border: 0;
+  border-radius: 12px;
+  background: transparent;
+  transform: translateY(10px) scale(0.86);
+  opacity: 0;
+  transition: background var(--duration) var(--ease), transform var(--duration) var(--ease);
+}
+
+.reaction-panel.is-open .reaction-sticker {
+  transform: none;
+  opacity: 1;
+  transition-delay: calc(var(--i) * 18ms);
+}
+
+.reaction-sticker img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: contain;
+  filter: drop-shadow(0 4px 6px rgba(36, 56, 74, 0.2));
+  transition: transform 180ms var(--ease), filter 180ms var(--ease);
+}
+
+.reaction-sticker:hover {
+  background: rgba(63, 122, 168, 0.1);
+}
+
+.reaction-sticker:hover img,
+.reaction-sticker:focus-visible img {
+  transform: translateY(-5px) scale(1.16) rotate(-4deg);
+  filter: drop-shadow(0 10px 12px rgba(36, 56, 74, 0.28));
+}
+
+.reaction-sticker:active img {
+  transform: translateY(-1px) scale(0.96);
+  filter: drop-shadow(0 3px 5px rgba(36, 56, 74, 0.24));
+}
+
+.reaction-sticker:focus-visible {
+  outline: 2px solid var(--cobalt-bright);
+  outline-offset: -2px;
 }
 
 /* --- Chips (side / room) ------------------------------------------------ */
@@ -712,6 +853,175 @@ button.chip:hover {
   gap: 8px;
 }
 
+/* --- Side picker -------------------------------------------------------- */
+
+/*
+ * Three choices on one rail, the same weight as the mode switch. Red and
+ * black carry their own colour on the active chip so the choice is readable
+ * before the label is: this is the one place in the room where colour is the
+ * answer, not decoration.
+ */
+.seat-picker {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px;
+  padding: 4px;
+  margin-bottom: 10px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.6);
+}
+
+.seat-choice {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 38px;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--ink-soft);
+  font-family: var(--font-body);
+  font-size: 13px;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+  transition: background var(--duration) var(--ease), color var(--duration) var(--ease);
+}
+
+.seat-choice:hover {
+  color: var(--cobalt);
+  background: rgba(47, 95, 134, 0.06);
+}
+
+.seat-choice-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  border: 1.5px solid currentColor;
+  opacity: 0.55;
+}
+
+.seat-choice.is-active {
+  background: #e6f0f7;
+  color: var(--cobalt);
+  box-shadow: inset 0 0 0 1px rgba(47, 95, 134, 0.18);
+}
+
+.seat-choice.is-active .seat-choice-dot {
+  opacity: 1;
+  background: currentColor;
+}
+
+.seat-choice[data-seat='red'].is-active {
+  background: #f7e9e7;
+  color: #a8433a;
+  box-shadow: inset 0 0 0 1px rgba(180, 70, 60, 0.22);
+}
+
+.seat-choice[data-seat='red'] .seat-choice-dot {
+  border-color: #b4463c;
+}
+
+.seat-choice[data-seat='black'] .seat-choice-dot {
+  border-color: var(--cobalt);
+}
+
+.seat-choice[data-seat='random'] .seat-choice-dot {
+  background: linear-gradient(90deg, #b4463c 0 50%, var(--cobalt) 50% 100%);
+  border: 0;
+  opacity: 0.9;
+}
+
+/* --- Seat roster (waiting view) ----------------------------------------- */
+
+.seat-roster {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  width: 100%;
+}
+
+.seat-card {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  grid-template-rows: auto auto;
+  align-items: center;
+  gap: 2px 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.7);
+  text-align: left;
+}
+
+.seat-card-dot {
+  grid-row: 1 / 3;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+}
+
+.seat-card[data-side='red'] .seat-card-dot {
+  background: #b4463c;
+  box-shadow: 0 0 10px rgba(180, 70, 60, 0.4);
+}
+
+.seat-card[data-side='black'] .seat-card-dot {
+  background: var(--cobalt);
+  box-shadow: 0 0 10px rgba(47, 95, 134, 0.4);
+}
+
+.seat-card.is-empty .seat-card-dot {
+  background: transparent;
+  border: 1.5px dashed var(--ink-faint);
+  box-shadow: none;
+}
+
+.seat-card-name {
+  font-size: 13px;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.seat-card.is-empty .seat-card-name {
+  color: var(--ink-faint);
+}
+
+.seat-card-tag {
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  color: var(--ink-faint);
+}
+
+.seat-card.is-you {
+  border-color: rgba(47, 95, 134, 0.4);
+  background: rgba(230, 240, 247, 0.85);
+}
+
+.seat-card.is-you .seat-card-tag {
+  color: var(--cobalt);
+  font-weight: 600;
+}
+
+.seat-card[data-side='red'].is-you {
+  border-color: rgba(180, 70, 60, 0.4);
+  background: rgba(247, 233, 231, 0.85);
+}
+
+.seat-card[data-side='red'].is-you .seat-card-tag {
+  color: #a8433a;
+}
+
+.seat-summary {
+  margin: 0;
+  color: var(--ink-soft);
+}
+
 .room-actions .primary-button,
 .room-actions .ghost-button {
   flex: 1;
@@ -911,6 +1221,46 @@ button.chip:hover {
 
   .sound-toggle {
     min-width: 36px;
+  }
+
+  /* The top bar is the tightest row on a phone: the tray keeps its painted
+     icon and drops the word, and the panel opens as a centred sheet that can
+     reach the full width instead of being pinned under a narrow button. */
+  .reaction-toggle {
+    min-width: 36px;
+    justify-content: center;
+    padding-inline: 6px;
+  }
+
+  .reaction-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .reaction-panel {
+    position: fixed;
+    top: auto;
+    right: 8px;
+    bottom: calc(64px + env(safe-area-inset-bottom));
+    left: 8px;
+    padding: 10px;
+    transform-origin: bottom center;
+  }
+
+  .reaction-grid {
+    grid-template-columns: repeat(6, 1fr);
+    gap: 2px;
+  }
+
+  .reaction-sticker {
+    width: 100%;
+    aspect-ratio: 1;
+    height: auto;
+    padding: 5px;
   }
 
   .sound-label {
@@ -1158,9 +1508,38 @@ button.chip:hover {
   .hud-top:has(.room-chip:not([hidden])) .hud-controls { flex: 1; justify-content: space-between; }
   .hud-controls { gap: 4px; }
   .hud-controls .ghost-button { padding-inline: 7px; }
+
+  /* The mark alone carries the brand at this width; the caption would push
+     the mode switch into a second line of text. Nothing in the bar wraps. */
+  .brand-word { display: none; }
+  .seg-button,
+  .hud-controls .ghost-button { white-space: nowrap; }
 }
 @media (max-height: 520px) and (orientation: landscape) {
   .move-activity, .turn-banner { left: calc((100% - 220px) / 2); }
   .move-activity { bottom: 12px; }
   .turn-banner { top: 58px; }
+
+  /* Landscape phones have almost no vertical room: the full-width sheet that
+     works in portrait would cover the whole board, so the tray tethers back to
+     its button and stays a compact grid. */
+  .reaction-panel {
+    position: absolute;
+    top: calc(100% + 8px);
+    right: 0;
+    bottom: auto;
+    left: auto;
+    width: 268px;
+    padding: 8px;
+    transform-origin: top right;
+  }
+
+  .reaction-grid {
+    grid-template-columns: repeat(4, 1fr);
+    gap: 2px;
+  }
+
+  .reaction-sticker {
+    padding: 4px;
+  }
 }

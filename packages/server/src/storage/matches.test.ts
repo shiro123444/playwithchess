@@ -21,13 +21,20 @@ let directory = '';
 beforeEach(() => { directory = mkdtempSync(join(tmpdir(), 'xiangqi-match-')); vi.stubEnv('XIANGQI_DATA_DIR', directory); });
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); vi.unstubAllEnvs(); rmSync(directory, { recursive: true, force: true }); });
 function room(code?: string, initialClockMs = 0) { const instance = new XiangqiRoom(); instance.onCreate(code ? { code } : { initialClockMs }); return instance as XiangqiRoom & { clients: any[]; handlers: Map<string, (client: any, payload?: any) => void> }; }
-function joinRoom(instance: ReturnType<typeof room>, id: string, token?: string) {
+function joinRoom(instance: ReturnType<typeof room>, id: string, token?: string, preferredSeat?: string) {
   const messages: Array<{ type: string; payload: any }> = [];
   const client: any = { sessionId: id, send: (type: string, payload: any) => messages.push({ type, payload: structuredClone(payload) }) };
   instance.clients.push(client);
-  try { instance.onJoin(client, { displayName: id, resumeToken: token }); }
+  try {
+    instance.onJoin(client, {
+      displayName: id,
+      ...(token ? { resumeToken: token } : {}),
+      ...(preferredSeat ? { preferredSeat } : {}),
+    });
+  }
   catch (error) { instance.clients.splice(instance.clients.indexOf(client), 1); throw error; }
   return { client, messages, token: () => messages.filter(m => m.type === 'identity').at(-1)?.payload.resumeToken,
+    seat: () => messages.filter(m => m.type === 'seats').at(-1)?.payload.yourSeat,
     message: (type: string, payload?: any) => instance.handlers.get(type)!(client, payload) };
 }
 function saved(code: string) { return new MatchStore(directory).load(code)!; }
@@ -104,4 +111,30 @@ describe('server persistence and seat authority', () => {
     table.onDispose();
   });
 
+  it('honours the side a joiner asked for while that seat is free', () => {
+    const table = room();
+    expect(joinRoom(table, 'want-black', undefined, 'black').seat()).toBe('black');
+    // The second player asked for black too, so they get the only seat left.
+    expect(joinRoom(table, 'also-black', undefined, 'black').seat()).toBe('red');
+    expect(saved(table.code).reservations.red?.name).toBe('also-black');
+    expect(saved(table.code).reservations.black?.name).toBe('want-black');
+    const spectator = joinRoom(table, 'late', undefined, 'red');
+    expect(spectator.seat()).toBe('spectator');
+    expect(spectator.token()).toBeNull();
+  });
+
+  it('treats an unknown or random preference as "first free seat"', () => {
+    const table = room();
+    expect(joinRoom(table, 'A', undefined, 'random').seat()).toBe('red');
+    expect(joinRoom(table, 'B', undefined, 'purple').seat()).toBe('black');
+  });
+
+  it('never lets a requested seat bypass a reserved one', () => {
+    const table = room(); const a = joinRoom(table, 'A', undefined, 'red');
+    table.onLeave(a.client, 4000);
+    // A's seat is reserved but offline; a newcomer asking for red gets black.
+    expect(joinRoom(table, 'B', undefined, 'red').seat()).toBe('black');
+    // …and the reservation still belongs to A.
+    expect(joinRoom(table, 'A-back', a.token()).seat()).toBe('red');
+  });
 });

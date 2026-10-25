@@ -1,6 +1,5 @@
 import { ColyseusSDK, type Room } from '@colyseus/sdk';
 import { BLACK, RED, type Color, type GameStatus, type GameRecord } from '@xiangqi/rules';
-
 /**
  * Online transport for the authoritative server.
  *
@@ -11,6 +10,12 @@ import { BLACK, RED, type Color, type GameStatus, type GameRecord } from '@xiang
  */
 
 export type Tone = 'idle' | 'ok' | 'error';
+
+/**
+ * The side a player asks for when joining. `random` takes whichever seat is
+ * still open, which is what an invitation link should do by default.
+ */
+export type PreferredSeat = 'red' | 'black' | 'random';
 
 export interface SeatNames {
   red: string | null;
@@ -24,6 +29,8 @@ export interface RoomState {
   spectators: number;
   /** One of the two seats is still empty, so the game has not begun. */
   waiting: boolean;
+  /** The seat this client ended up with, which may differ from what it asked for. */
+  yourSeat: 'red' | 'black' | 'spectator';
 }
 
 export interface OnlineHandlers {
@@ -39,6 +46,8 @@ export interface OnlineHandlers {
   onRecord: (record: GameRecord) => void;
   onIdentity?: (identity: { code: string; gameId: string; seat: 'red' | 'black' | 'spectator'; resumeToken: string | null }) => void;
   onUndo?: (request: { seat: 'red' | 'black'; ply: number; count: number } | null) => void;
+  /** A sticker from anyone in the room, including this client's own seat. */
+  onReaction?: (reaction: { id: string; seat: 'red' | 'black' | 'spectator'; name: string }) => void;
 }
 
 interface SnapshotMessage {
@@ -141,8 +150,11 @@ export class OnlineSession {
 
   /**
    * Join an existing room by code, or create a fresh table without a code.
+   *
+   * `preferredSeat` is a wish, not a guarantee: if the side is already taken
+   * the server seats the player on the free side instead of turning them away.
    */
-  async connect(code?: string | null, resumeToken?: string): Promise<void> {
+  async connect(code?: string | null, resumeToken?: string, preferredSeat: PreferredSeat = 'random'): Promise<void> {
     if (this.room) return;
     this.handlers.onStatus('连接中', 'idle');
 
@@ -150,6 +162,7 @@ export class OnlineSession {
     const options = {
       displayName: displayName(),
       variantId: 'xiangqi',
+      preferredSeat,
       ...(resumeToken ? { resumeToken } : {}),
     };
     // Creating always makes a private table; entering a code never silently
@@ -203,6 +216,9 @@ export class OnlineSession {
   requestUndo(): void { this.room?.send('undo-request'); }
   answerUndo(accept: boolean): void { this.room?.send('undo-answer', { accept }); }
   resign(): void { this.room?.send('resign'); }
+
+  /** Send a sticker; the server echoes it back so every tile draws the same way. */
+  sendReaction(id: string): void { this.room?.send('reaction', { id }); }
 
   sendChat(body: string): void {
     this.room?.send('chat', { body });
@@ -259,6 +275,17 @@ export class OnlineSession {
       this.handlers.onStatus(`${message.from}: ${message.body}`, 'idle');
     });
 
+    room.onMessage('reaction', (message: { id?: unknown; seat?: unknown; name?: unknown }) => {
+      if (typeof message?.id !== 'string') return;
+      const seat = message.seat === 'red' || message.seat === 'black' || message.seat === 'spectator'
+        ? message.seat : 'spectator';
+      this.handlers.onReaction?.({
+        id: message.id,
+        seat,
+        name: typeof message.name === 'string' ? message.name : '棋友',
+      });
+    });
+
     room.onDrop(() => {
       if (this.cancelled) return;
       this.joined = false;
@@ -307,6 +334,7 @@ export class OnlineSession {
       seats: this.seats,
       spectators: this.spectators,
       waiting: this.syncing || !this.ready,
+      yourSeat: this.seat === RED ? 'red' : this.seat === BLACK ? 'black' : 'spectator',
     };
   }
 
